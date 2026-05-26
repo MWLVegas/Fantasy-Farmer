@@ -35,7 +35,7 @@ $authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' . $params;
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fantasy Farmer Login</title>
-  <link rel="stylesheet" href="assets/css/farm.css?v=0.2.1">
+  <link rel="stylesheet" href="assets/css/farm.css?v=0.3.15">
 </head>
 <body class="login-page">
   <main class="login-card">
