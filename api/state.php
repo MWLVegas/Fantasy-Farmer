@@ -6,44 +6,6 @@ ensurePlayerDefaults($db, $userId);
 ensureActiveOrder($db, $userId);
 processGrowth($db, $userId);
 
-// v0.3.12 hard safety: clamp bad active order timers from earlier builds before fetching state.
-$stmt = $db->prepare("
-    UPDATE player_orders
-    SET expires_at = DATE_ADD(NOW(), INTERVAL FLOOR(30 + RAND() * 31) MINUTE)
-    WHERE user_id = ?
-      AND is_fulfilled = 0
-      AND is_expired = 0
-      AND expires_at > DATE_ADD(NOW(), INTERVAL 60 MINUTE)
-");
-$stmt->bind_param('i', $userId);
-$stmt->execute();
-
-$stmt = $db->prepare("
-    UPDATE player_orders
-    SET is_expired = 1,
-        next_available_at = DATE_ADD(NOW(), INTERVAL FLOOR(1 + RAND() * 4) MINUTE)
-    WHERE user_id = ?
-      AND is_fulfilled = 0
-      AND is_expired = 0
-      AND expires_at < NOW()
-");
-$stmt->bind_param('i', $userId);
-$stmt->execute();
-
-
-
-// v0.3.13 hard clamp: old buggy active orders must never stay above 60 minutes.
-$stmt = $db->prepare("
-    UPDATE player_orders
-    SET expires_at = DATE_ADD(NOW(), INTERVAL FLOOR(30 + RAND() * 31) MINUTE)
-    WHERE user_id = ?
-      AND is_fulfilled = 0
-      AND is_expired = 0
-      AND expires_at > DATE_ADD(NOW(), INTERVAL 60 MINUTE)
-");
-$stmt->bind_param('i', $userId);
-$stmt->execute();
-
 $stmt = $db->prepare("SELECT user_id, display_name, coins, energy FROM users WHERE user_id = ? LIMIT 1");
 $stmt->bind_param('i', $userId);
 $stmt->execute();
@@ -97,7 +59,7 @@ $plants = $stmt->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->prepare("
     SELECT i.item_id, i.code, i.name, i.item_type, i.base_buy_price, i.base_sell_price, i.icon, inv.quantity
-    FROM inventory inv
+    FROM player_inventory inv
     JOIN items i ON i.item_id = inv.item_id
     WHERE inv.user_id = ? AND inv.quantity > 0
     ORDER BY FIELD(i.item_type, 'seed','produce','processed','fuel','material'), i.name
@@ -110,10 +72,17 @@ $stmt = $db->prepare("
     SELECT pt.player_tool_id, t.*
     FROM player_tools pt
     JOIN tools t ON t.tool_id = pt.tool_id
+    JOIN (
+        SELECT t2.tool_type, MAX(t2.level) AS best_level
+        FROM player_tools pt2
+        JOIN tools t2 ON t2.tool_id = pt2.tool_id
+        WHERE pt2.user_id = ?
+        GROUP BY t2.tool_type
+    ) best ON best.tool_type = t.tool_type AND best.best_level = t.level
     WHERE pt.user_id = ?
     ORDER BY FIELD(t.tool_type, 'hoe','watering_can','shovel'), t.level
 ");
-$stmt->bind_param('i', $userId);
+$stmt->bind_param('ii', $userId, $userId);
 $stmt->execute();
 $tools = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
@@ -129,6 +98,8 @@ $machines = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->query("SELECT * FROM machines WHERE is_active = 1 ORDER BY base_cost ASC");
 $allMachines = $stmt->fetch_all(MYSQLI_ASSOC);
+
+$allTools = $db->query("SELECT * FROM tools WHERE is_active = 1 ORDER BY tool_type, level ASC")->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->query("
     SELECT r.*, ii.name AS input_name, ii.icon AS input_icon, oi.name AS output_name, oi.icon AS output_icon
@@ -158,22 +129,81 @@ $stmt = $db->prepare("SELECT pw.*, wt.name, wt.worker_role, wt.icon, wt.cost_per
 $stmt->bind_param('i', $userId); $stmt->execute(); $workers = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt = $db->prepare("SELECT * FROM player_worker_plant_order WHERE user_id = ? ORDER BY sort_order ASC");
 $stmt->bind_param('i', $userId); $stmt->execute(); $plantOrder = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt = $db->prepare("SELECT * FROM player_orders WHERE user_id = ? AND is_fulfilled = 0 AND is_expired = 0 ORDER BY player_order_id DESC LIMIT 1");
-$stmt->bind_param('i', $userId); $stmt->execute(); $order = $stmt->get_result()->fetch_assoc();
-$orderItems = [];
-if ($order) {
-    $stmt = $db->prepare("SELECT oi.*, i.name, i.icon, i.code, COALESCE(inv.quantity, 0) AS owned_quantity FROM order_items oi JOIN items i ON i.item_id = oi.item_id LEFT JOIN inventory inv ON inv.item_id = oi.item_id AND inv.user_id = ? WHERE oi.player_order_id = ?");
-    $oid = (int)$order['player_order_id']; $stmt->bind_param('ii', $userId, $oid); $stmt->execute(); $orderItems = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-
-    $remaining = max(0, strtotime($order['expires_at']) - time());
-    $order['time_remaining_seconds'] = min($remaining, 3600);
+$stmt = $db->prepare("SELECT * FROM player_orders WHERE user_id = ? AND order_status IN ('available','accepted') AND is_fulfilled = 0 ORDER BY FIELD(order_status, 'accepted', 'available'), expires_at ASC, player_order_id ASC");
+$stmt->bind_param('i', $userId);
+$stmt->execute();
+$allOpenOrders = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+$orderItemsByOrder = [];
+$orders = [];
+$availableOrders = [];
+foreach ($allOpenOrders as &$orderRow) {
+    $oid = (int)$orderRow['player_order_id'];
+    $stmt = $db->prepare("SELECT oi.*, i.name, i.icon, i.code, COALESCE(inv.quantity, 0) AS owned_quantity FROM order_items oi JOIN items i ON i.item_id = oi.item_id LEFT JOIN player_inventory inv ON inv.item_id = oi.item_id AND inv.user_id = ? WHERE oi.player_order_id = ?");
+    $stmt->bind_param('ii', $userId, $oid);
+    $stmt->execute();
+    $orderItemsByOrder[$oid] = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $remaining = max(0, strtotime($orderRow['expires_at']) - time());
+    $orderRow['time_remaining_seconds'] = min($remaining, 7200);
+    $orderRow['is_late'] = ($orderRow['order_status'] === 'accepted' && strtotime($orderRow['expires_at']) < time()) ? 1 : 0;
+    $lateFee = max(0, min(90, (int)($orderRow['late_fee_percent'] ?? 20)));
+    if (($orderRow['order_type'] ?? '') === 'rush') {
+        $basePayment = (int)($orderRow['base_payment_coins'] ?? 0);
+        if ($basePayment <= 0) {
+            $basePayment = (int)floor((int)$orderRow['payment_coins'] / 1.2);
+        }
+        $orderRow['late_payment_coins'] = (int)floor($basePayment * (100 - $lateFee) / 100);
+        $orderRow['late_total_penalty_percent'] = 40;
+    } else {
+        $orderRow['late_payment_coins'] = (int)floor((int)$orderRow['payment_coins'] * (100 - $lateFee) / 100);
+        $orderRow['late_total_penalty_percent'] = $lateFee;
+    }
+    if ($orderRow['order_status'] === 'accepted') $orders[] = $orderRow;
+    else $availableOrders[] = $orderRow;
 }
+unset($orderRow);
+$order = $orders[0] ?? null;
+$orderItems = $order ? ($orderItemsByOrder[(int)$order['player_order_id']] ?? []) : [];
+$orderSlotLimit = getOrderSlotLimit($db, $userId);
+$availableOrderLimit = getAvailableOrderLimit($db);
+
+$progress = getPlayerProgress($db, $userId);
+maybeGrantMarketInvite($db, $userId);
+$locations = getLocationsForPlayer($db, $userId);
+$unlocks = [];
+$stmt = $db->prepare("SELECT unlock_key, source, unlocked_at FROM player_unlocks WHERE user_id = ? ORDER BY unlocked_at ASC");
+$stmt->bind_param('i', $userId);
+$stmt->execute();
+$res = $stmt->get_result();
+while ($row = $res->fetch_assoc()) $unlocks[] = $row;
+
+$relics = [];
+$stmt = $db->prepare("SELECT * FROM player_relics WHERE user_id = ? ORDER BY discovered_at DESC LIMIT 20");
+$stmt->bind_param('i', $userId);
+$stmt->execute();
+$relics = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+$helperEquipment = $db->query("SELECT * FROM helper_equipment WHERE is_active = 1 ORDER BY sort_order ASC, name ASC")->fetch_all(MYSQLI_ASSOC);
+$helperTypes = $db->query("SELECT * FROM helper_types WHERE is_active = 1 ORDER BY sort_order ASC, name ASC")->fetch_all(MYSQLI_ASSOC);
+$stmt = $db->prepare("
+    SELECT ph.*, ht.name, ht.species_key, ht.icon, he.name AS equipment_name, he.task_type
+    FROM player_helpers ph
+    JOIN helper_types ht ON ht.helper_type_id = ph.helper_type_id
+    LEFT JOIN helper_equipment he ON he.helper_equipment_id = ph.equipped_helper_equipment_id
+    WHERE ph.user_id = ?
+    ORDER BY ph.player_helper_id ASC
+");
+$stmt->bind_param('i', $userId);
+$stmt->execute();
+$helpers = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $systemIcons = [];
 $sys = $db->query("SELECT code, icon FROM items WHERE item_type = 'system' AND is_active = 1");
 while ($row = $sys->fetch_assoc()) {
     $systemIcons[$row['code']] = $row['icon'];
 }
+
+$relicPickup = getActiveRelicPickup($db, $userId);
+$storyEvent = getPendingStoryEvent($db, $userId);
 
 $fertilizers = [];
 if ($gardenId) {
@@ -194,10 +224,19 @@ if ($gardenId) {
 
 jsonResponse([
     'ok' => true,
-    'version' => GAME_VERSION,
+    'version' => getAppVersion($db),
     'clock' => getGameClock($db, $userId),
     'shop_refresh' => getShopRefresh($db, $userId),
-    'user' => $user,
+    'user' => array_merge($user, $progress),
+    'progress' => $progress,
+    'unlocks' => $unlocks,
+    'locations' => $locations,
+    'map_config' => getMapConfig($db),
+    'relics' => $relics,
+    'relic_pickup' => $relicPickup,
+    'story_event' => $storyEvent,
+    'helper_types' => $helperTypes,
+    'helper_equipment' => $helperEquipment,
     'is_admin' => isAdminUser($db, $userId),
     'garden' => $garden,
     'plots' => $plots,
@@ -207,6 +246,7 @@ jsonResponse([
     'tools' => $tools,
     'machines' => $machines,
     'all_machines' => $allMachines,
+    'all_tools' => $allTools,
     'recipes' => $recipes,
     'jobs' => $jobs,
     'system_icons' => $systemIcons,
@@ -219,8 +259,14 @@ jsonResponse([
     })(),
     'workers' => $workers,
     'worker_types' => $workerTypes,
+    'helpers' => $helpers,
     'plant_order' => $plantOrder,
     'order' => $order,
+    'orders' => $orders,
+    'available_orders' => $availableOrders,
+    'order_slot_limit' => $orderSlotLimit,
+    'available_order_limit' => $availableOrderLimit,
     'order_items' => $orderItems,
+    'order_items_by_order' => $orderItemsByOrder,
     'server_time' => date('Y-m-d H:i:s')
 ]);

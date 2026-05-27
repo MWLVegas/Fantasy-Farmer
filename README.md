@@ -223,3 +223,170 @@ Notes:
 - This migration uses `ALTER TABLE`, `CREATE TABLE IF NOT EXISTS`, and `INSERT ... ON DUPLICATE KEY UPDATE`.
 - It does not drop content tables.
 - It does not wipe users, items, plants, game config, garden types, order name parts, or seed hybrid recipes.
+
+## v0.4.0
+
+### Added
+- Added the first architecture pass for world/location screens instead of simple tabs.
+- Added an Overhead Map canvas screen with unlocked/locked location buttons.
+- Added location scaffolding for:
+  - Garden
+  - General Store
+  - Orders Board
+  - Workroom / Shed
+  - Farmer's Market
+  - Caravan Camp
+  - Bone & Brine
+  - Forest Folk
+- Added player progression stats:
+  - Reputation: local trust, currently earned from completed orders.
+  - Recognition: larger-world progress, currently earned from relic/helper milestones.
+- Added `player_unlocks` for explicit story/progression flags instead of relying only on level numbers.
+- Added multi-order board scaffolding. Players can now have multiple active orders.
+- Added order categories:
+  - rush
+  - standard
+  - patient
+- Added reputation rewards to order completion.
+- Added 30–120 minute order timers for the multi-order board.
+- Added Farmer's Market unlock scaffolding at 10 reputation.
+- Added relic scaffolding through `player_relics`.
+- Added first-relic trigger scaffolding: the first full till with the Wooden Hoe can unearth a relic and unlock Madam Rune / caravan scaffolding.
+- Added Forest Folk helper scaffolding:
+  - helper species definitions
+  - helper equipment definitions
+  - player helper records
+- Added first fairy summon scaffolding:
+  - Fairy Bell is consumed by ringing it.
+  - A first water fairy is summoned.
+  - Aqua Amulet is granted/equipped as water-magic automation scaffolding.
+- Added future helper species scaffolds:
+  - Fairy
+  - Brownie
+  - Mushling
+  - Spriggan
+- Added future helper equipment scaffolds:
+  - Aqua Amulet
+  - Root Charm
+  - Harvest Charm
+  - Weedward Charm
+  - Bugbane Charm
+- Added Wooden/Iron versions of hoe, watering can, and shovel to the fresh schema/migration.
+- Added a canvas-side Weekly Special path for the Wooden Hoe.
+
+### Changed
+- The UI now defaults to the Overhead Map as the world hub.
+- The old Workers/Goblins concept has been renamed toward Forest Folk / Helpers.
+- Orders are now treated as a board/list rather than a single active request.
+- Order completion now awards reputation in addition to coins.
+- The right-side nav now represents locations/screens rather than old-style tabs.
+- Shop special/tool purchase scaffolding now supports buying tools directly.
+
+### Scaffolded / Not Fully Implemented Yet
+- Farmer's Market exists as an unlockable location, but its unique weekend inventory is not fully implemented yet.
+- Caravan Camp exists as a relic-triggered location, but recurring two-week caravan visits are not fully implemented yet.
+- Bone & Brine exists as a future permanent location, but its second-relic event/trade loop is not implemented yet.
+- Helper automation logic is scaffolded, but helpers do not yet perform timed watering/tilling/harvesting actions.
+- Fertilizer remains scaffolded from v0.3.15 and is preserved for future plot/crop effects.
+- Relics generate and unlock first-caravan scaffolding, but the full relic trading economy is not implemented yet.
+
+### Database
+- Requires `schema_v0_4_0.sql` when upgrading from v0.3.15.
+- Fresh rebuilds can use `schema.sql` directly.
+- This release may also be safely tested with a database wipe/rebuild because current persistent content is not production-critical.
+- The migration adds progression/unlock/relic/helper scaffolding and order reward columns.
+
+## v0.4.1
+
+- Hidden/locked map locations now render as `???` with a `?` icon so future places are not spoiled before unlock.
+- Removed the countdown from the top Orders button; it now acts as an Orders Board shortcut and shows a badge count instead.
+- Orders Board flow now lives on the canvas: click the Orders button to view the board, then click an order card to review/fulfill that specific order.
+- Regular orders no longer display the word `standard`; rush jobs are called out with a visible `Rush Job` label and a warmer tinted card/background.
+- Reduced duplicate side navigation; the map canvas is the primary travel UI, with only Back to Map retained as explicit navigation.
+- Fixed garden tool/cursor bleed into non-garden locations. Leaving the garden now clears garden interaction state, hides the custom tool cursor, stops repeat tool actions, and prevents clicks from watering/tilling/using plots behind other canvases.
+
+
+## v0.4.2
+
+- Restored an Inventory button so the backpack canvas remains reachable without reintroducing the old full navigation stack.
+- Orders Board button now shows `Orders: current/max` instead of a timer.
+- Orders now arrive gradually every 3–5 real-life minutes when a slot is free instead of instantly refilling every slot.
+- Order details now refresh item ownership counts after inventory changes, including harvests.
+- Reputation and recognition now have shared icons and floating gain feedback.
+- Tool upgrades now replace older tools of the same type instead of keeping broken/old versions.
+- Added `schema_v0_4_2.sql` for order pacing and tool cleanup.
+
+
+## v0.4.3 - First Relic and Madam Rune Intro
+
+### Added
+- First Wooden Hoe full-till now spawns a visible relic pickup on the garden canvas instead of silently unlocking caravan scaffolding.
+- Added the `Strange Buried Relic` inventory item as the first story relic.
+- Added a relic pickup modal with the `Take the Relic` button.
+- Added Madam Rune's three-page intro event, scheduled for noon on the next in-game day after collecting the first relic.
+- Madam Rune now trades the first relic for a `Fairy Bell` and `Aqua Amulet`, both added through the ghost inventory feedback.
+- The Fairy Bell can now be used from inventory to summon the first water fairy.
+- Added `schema_v0_4_3.sql` for relic pickup/story scheduling columns and repair of premature v0.4.0-v0.4.2 first-relic unlocks.
+
+### Changed
+- The first relic no longer immediately unlocks Madam Rune or the caravan location when tilled up; that now happens through the story event.
+- Fairy summoning now consumes the actual `Fairy Bell` inventory item.
+
+### Notes
+- Later relics remain scaffolded for future generic relic drops and caravan trades.
+
+## v0.4.4 — Story Event Engine
+
+- Added database-backed story event scaffolding: `events`, `event_steps`, `event_triggers`, and `player_event_state`.
+- Moved Madam Rune's intro/trade sequence into database event steps.
+- Moved Fairy Bell summoning into a real multi-step event instead of a one-click toast/teleport.
+- Added generic event advancement API so future story beats can be written as data instead of hardcoded JavaScript.
+- Event step effects now support inventory changes, unlock flags, recognition changes, relic trades, location unlocks, and helper summoning.
+- Added `schema_v0_4_4.sql` migration.
+
+## v0.4.5
+
+- SQL patch files now live in `/database/` instead of the project root.
+- Renamed the database table `inventory` to `player_inventory` and updated PHP/schema references for consistency.
+- Reworked the Orders Board into two sections: Confirmed Orders and Available Orders.
+- Available orders now sit on the board for a short time before expiring off the board.
+- Available orders are accepted manually; accepting an order starts its fulfillment timer.
+- Confirmed order slots are separate from available-board capacity.
+- Confirmed orders can be completed late instead of disappearing; late completion gives reduced coins and no reputation.
+- Added cancel behavior for confirmed orders: canceling costs reputation down to a floor of 0.
+- Added configurable order pacing and limits to `game_config`.
+- Updated order detail actions: `Confirm Order`, `Complete`, and `Cancel (-1 ⭐)`.
+
+## v0.4.6
+- Cleaned up Orders Board wording and reward display.
+- Available orders now show the board timer on the right instead of “Leaves board” text.
+- Available orders show requested quantities only; confirmed orders show owned/required progress.
+- Confirmed orders now show `Order due` language, with Rush Order callout when applicable.
+- Rush orders use a database-configured +20% rush fee.
+- Late rush orders lose the rush fee and then take the normal late fee from the base value.
+- App version now comes from `game_config.app_version` instead of being rendered from a hardcoded index line.
+- Consolidated duplicate order/modal CSS rules while keeping story modal styles intact.
+
+## v0.4.7
+
+- Fixed order reward tooltip markup leaking into Orders Board and Order Details text.
+- Available order details now show the accepted deadline as `Deadline: X minutes` with a rush marker when applicable.
+- Order board reward text now renders as plain `🪙 amount · ⭐ amount` on canvas while preserving safe tooltip behavior in modal HTML.
+- Bumped database-backed app version to `v0.4.7`.
+
+
+## v0.4.8
+
+- Fixed the shared tooltip element so `.ff-tooltip.hidden` actually hides it.
+- Restored fixed-position tooltip placement for canvas and DOM hover targets.
+- Hardened tooltip mounting so it works whether the script loads before or after DOM ready.
+- Bumped database-backed app version to v0.4.8.
+
+
+## v0.4.9
+
+- Fixed DOM icon rendering for clock icons: values containing a file extension now render as images, while plain values render as emoji/text.
+- Restored the top HUD coin pill styling and kept stat/coin pills consolidated instead of adding duplicate CSS layers.
+- Added map background scaffolding through `game_config.map_background_image`.
+- Added map button coordinate scaffolding through `game_config.map_button_positions_json` so future illustrated maps can place location buttons by pixel position.
+- Bumped database-backed app version to v0.4.9.

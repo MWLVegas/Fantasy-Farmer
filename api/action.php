@@ -53,8 +53,14 @@ try {
         $stmt->bind_param('iiii', $strength, $strength, $plotId, $userId);
         $stmt->execute();
 
+        $relicName = maybeFindFirstRelicFromTilling($db, $userId, $plotId, $tool);
+        $message = toolMessage($tool, 'Tilled.');
+        if ($relicName) {
+            $message = 'Something strange surfaced in the soil.';
+        }
+
         $db->commit();
-        jsonResponse(['ok' => true, 'message' => toolMessage($tool, 'Tilled.')]);
+        jsonResponse(['ok' => true, 'message' => $message, 'relic_spawned' => (bool)$relicName, 'relic_found' => $relicName]);
     }
 
     if ($action === 'water') {
@@ -277,6 +283,141 @@ try {
         jsonResponse(['ok' => true, 'message' => '+' . $coins . ' coins.']);
     }
 
+    if ($action === 'buy_tool') {
+        $toolId = (int) ($input['tool_id'] ?? 0);
+
+        $stmt = $db->prepare("SELECT * FROM tools WHERE tool_id = ? AND is_active = 1 LIMIT 1");
+        $stmt->bind_param('i', $toolId);
+        $stmt->execute();
+        $tool = $stmt->get_result()->fetch_assoc();
+        if (!$tool) throw new RuntimeException('Tool not found.');
+
+        $stmt = $db->prepare("
+            SELECT pt.player_tool_id, t.level
+            FROM player_tools pt
+            JOIN tools t ON t.tool_id = pt.tool_id
+            WHERE pt.user_id = ? AND t.tool_type = ? AND t.level >= ?
+            LIMIT 1
+        ");
+        $toolType = $tool['tool_type'];
+        $toolLevel = (int)$tool['level'];
+        $stmt->bind_param('isi', $userId, $toolType, $toolLevel);
+        $stmt->execute();
+        if ($stmt->get_result()->fetch_assoc()) throw new RuntimeException('You already own that tool or better.');
+
+        $cost = (int)$tool['upgrade_cost'];
+        $stmt = $db->prepare("SELECT coins FROM users WHERE user_id = ? LIMIT 1");
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $user = $stmt->get_result()->fetch_assoc();
+        if (!$user || (int)$user['coins'] < $cost) throw new RuntimeException('Not enough coins.');
+
+        $stmt = $db->prepare("UPDATE users SET coins = coins - ? WHERE user_id = ?");
+        $stmt->bind_param('ii', $cost, $userId);
+        $stmt->execute();
+        $stmt = $db->prepare("
+            DELETE pt
+            FROM player_tools pt
+            JOIN tools old_tool ON old_tool.tool_id = pt.tool_id
+            WHERE pt.user_id = ?
+              AND old_tool.tool_type = ?
+              AND old_tool.level < ?
+        ");
+        $stmt->bind_param('isi', $userId, $toolType, $toolLevel);
+        $stmt->execute();
+
+        $stmt = $db->prepare("INSERT INTO player_tools (user_id, tool_id) VALUES (?, ?)");
+        $stmt->bind_param('ii', $userId, $toolId);
+        $stmt->execute();
+
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => $tool['name'] . ' bought.']);
+    }
+
+    if ($action === 'collect_relic') {
+        $relicId = (int)($input['relic_id'] ?? 0);
+        $stmt = $db->prepare("SELECT * FROM player_relics WHERE relic_id = ? AND user_id = ? AND collected_at IS NULL LIMIT 1");
+        $stmt->bind_param('ii', $relicId, $userId);
+        $stmt->execute();
+        $relic = $stmt->get_result()->fetch_assoc();
+        if (!$relic) throw new RuntimeException('Relic not found.');
+
+        $item = $db->query("SELECT item_id, code, name, icon FROM items WHERE code = 'relic_first_oddity' LIMIT 1")->fetch_assoc();
+        if (!$item) throw new RuntimeException('Missing relic item.');
+
+        addInventory($db, $userId, (int)$item['item_id'], 1);
+
+        $stmt = $db->prepare("UPDATE player_relics SET collected_at = NOW(), visual_state = 'collected' WHERE relic_id = ? AND user_id = ?");
+        $stmt->bind_param('ii', $relicId, $userId);
+        $stmt->execute();
+
+        grantUnlock($db, $userId, 'first_relic_collected', 'first_relic_pickup');
+        scheduleMadamRuneVisit($db, $userId);
+
+        $db->commit();
+        jsonResponse([
+            'ok' => true,
+            'message' => 'Relic taken.',
+            'rewards' => [[
+                'code' => $item['code'],
+                'name' => $item['name'],
+                'icon' => $item['icon'],
+                'quantity' => 1
+            ]]
+        ]);
+    }
+
+    if ($action === 'advance_story_event') {
+        $eventKey = trim((string)($input['event_key'] ?? ''));
+        if ($eventKey === '') {
+            throw new RuntimeException('Missing event key.');
+        }
+        $result = advancePlayerEvent($db, $userId, $eventKey);
+        $db->commit();
+        jsonResponse($result);
+    }
+
+    if ($action === 'start_fairy_bell_event') {
+        if (!hasUnlock($db, $userId, 'madam_rune_intro_seen')) {
+            throw new RuntimeException('The bell has not found its way to you yet.');
+        }
+        if (hasUnlock($db, $userId, 'helpers_unlocked')) {
+            throw new RuntimeException('A helper has already answered the first bell.');
+        }
+        $bellItem = $db->query("SELECT i.item_id, COALESCE(inv.quantity,0) AS qty FROM items i LEFT JOIN player_inventory inv ON inv.item_id = i.item_id AND inv.user_id = " . (int)$userId . " WHERE i.code = 'fairy_bell' LIMIT 1")->fetch_assoc();
+        if (!$bellItem || (int)$bellItem['qty'] < 1) {
+            throw new RuntimeException('You need the Fairy Bell to summon a helper.');
+        }
+        $event = startPlayerEvent($db, $userId, 'fairy_bell_summon');
+        $db->commit();
+        jsonResponse(['ok' => true, 'story_event' => $event]);
+    }
+
+    // Legacy compatibility routes now run through the database-backed event system.
+    if ($action === 'complete_madam_rune_intro') {
+        $event = startPlayerEvent($db, $userId, 'madam_rune_intro');
+        while ($event) {
+            $advanced = advancePlayerEvent($db, $userId, 'madam_rune_intro');
+            if (!empty($advanced['complete'])) {
+                $db->commit();
+                jsonResponse(['ok' => true, 'message' => 'Madam Rune trades you the Fairy Bell and Aqua Amulet.', 'rewards' => $advanced['effects']['rewards'] ?? []]);
+            }
+            $event = $advanced['story_event'] ?? null;
+        }
+        throw new RuntimeException('Madam Rune event could not complete.');
+    }
+
+    if ($action === 'summon_first_fairy') {
+        startPlayerEvent($db, $userId, 'fairy_bell_summon');
+        while (true) {
+            $advanced = advancePlayerEvent($db, $userId, 'fairy_bell_summon');
+            if (!empty($advanced['complete'])) {
+                $db->commit();
+                jsonResponse(['ok' => true, 'message' => 'The bell rings once, vanishes, and a very excited water fairy arrives.']);
+            }
+        }
+    }
+
     if ($action === 'buy_machine') {
         $machineId = (int) ($input['machine_id'] ?? 0);
 
@@ -461,27 +602,87 @@ try {
         $db->commit(); jsonResponse(['ok'=>true,'message'=>'Worker toggled.']);
     }
 
+    if ($action === 'accept_order') {
+        $orderId = (int)($input['player_order_id'] ?? 0);
+        $slotLimit = getOrderSlotLimit($db, $userId);
+        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM player_orders WHERE user_id=? AND order_status='accepted' AND is_fulfilled=0");
+        $stmt->bind_param('i', $userId); $stmt->execute();
+        $accepted = (int)($stmt->get_result()->fetch_assoc()['c'] ?? 0);
+        if ($accepted >= $slotLimit) throw new RuntimeException('Your confirmed order slots are full.');
+
+        $stmt = $db->prepare("SELECT * FROM player_orders WHERE player_order_id=? AND user_id=? AND order_status='available' AND expires_at>NOW() LIMIT 1");
+        $stmt->bind_param('ii', $orderId, $userId); $stmt->execute();
+        $order = $stmt->get_result()->fetch_assoc();
+        if (!$order) throw new RuntimeException('That order is no longer available.');
+
+        $minutes = max(1, (int)($order['fulfillment_minutes'] ?? 60));
+        $stmt = $db->prepare("UPDATE player_orders SET order_status='accepted', accepted_at=NOW(), expires_at=DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE player_order_id=? AND user_id=?");
+        $stmt->bind_param('iii', $minutes, $orderId, $userId);
+        $stmt->execute();
+        $db->commit();
+        jsonResponse(['ok'=>true,'message'=>'Order confirmed.']);
+    }
+
+    if ($action === 'cancel_order') {
+        $orderId = (int)($input['player_order_id'] ?? 0);
+        $stmt = $db->prepare("SELECT * FROM player_orders WHERE player_order_id=? AND user_id=? AND order_status='accepted' AND is_fulfilled=0 LIMIT 1");
+        $stmt->bind_param('ii', $orderId, $userId); $stmt->execute();
+        $order = $stmt->get_result()->fetch_assoc();
+        if (!$order) throw new RuntimeException('Order is not active.');
+        $penalty = max(0, (int)($order['cancel_reputation_penalty'] ?? 1));
+        if ($penalty > 0) {
+            $stmt = $db->prepare("UPDATE player_state SET reputation = GREATEST(0, reputation - ?) WHERE user_id=?");
+            $stmt->bind_param('ii', $penalty, $userId); $stmt->execute();
+        }
+        $stmt = $db->prepare("UPDATE player_orders SET order_status='cancelled', is_expired=1 WHERE player_order_id=? AND user_id=?");
+        $stmt->bind_param('ii', $orderId, $userId); $stmt->execute();
+        $db->commit();
+        jsonResponse(['ok'=>true,'message'=>'Order cancelled. -'.$penalty.' reputation.', 'reputation_delta'=>-$penalty]);
+    }
+
     if ($action === 'fulfill_order') {
         $orderId = (int)($input['player_order_id'] ?? 0);
-        $stmt = $db->prepare("SELECT * FROM player_orders WHERE player_order_id=? AND user_id=? AND is_fulfilled=0 AND is_expired=0 AND expires_at>NOW() LIMIT 1");
+        $stmt = $db->prepare("SELECT * FROM player_orders WHERE player_order_id=? AND user_id=? AND order_status='accepted' AND is_fulfilled=0 LIMIT 1");
         $stmt->bind_param('ii', $orderId, $userId); $stmt->execute(); $order = $stmt->get_result()->fetch_assoc();
-        if (!$order) throw new RuntimeException('Order is not available.');
+        if (!$order) throw new RuntimeException('Order is not active.');
         $stmt = $db->prepare("SELECT * FROM order_items WHERE player_order_id=?");
         $stmt->bind_param('i', $orderId); $stmt->execute(); $items = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
         foreach ($items as $item) {
             $itemId=(int)$item['item_id']; $need=(int)$item['quantity_required'];
-            $stmt=$db->prepare("SELECT quantity FROM inventory WHERE user_id=? AND item_id=? LIMIT 1");
+            $stmt=$db->prepare("SELECT quantity FROM player_inventory WHERE user_id=? AND item_id=? LIMIT 1");
             $stmt->bind_param('ii',$userId,$itemId); $stmt->execute(); $inv=$stmt->get_result()->fetch_assoc();
             if (!$inv || (int)$inv['quantity'] < $need) throw new RuntimeException('You do not have everything for this order.');
         }
         foreach ($items as $item) removeInventory($db,$userId,(int)$item['item_id'],(int)$item['quantity_required']);
-        $payment=(int)$order['payment_coins'];
+        $late = strtotime($order['expires_at']) < time();
+        $lateFee = max(0, min(90, (int)($order['late_fee_percent'] ?? 20)));
+        $payment = (int)$order['payment_coins'];
+        if ($late) {
+            if (($order['order_type'] ?? '') === 'rush') {
+                $basePayment = (int)($order['base_payment_coins'] ?? 0);
+                if ($basePayment <= 0) {
+                    $basePayment = (int)floor($payment / 1.2);
+                }
+                $payment = (int)floor($basePayment * (100 - $lateFee) / 100);
+            } else {
+                $payment = (int)floor($payment * (100 - $lateFee) / 100);
+            }
+        }
         $stmt=$db->prepare("UPDATE users SET coins=coins+? WHERE user_id=?");
         $stmt->bind_param('ii',$payment,$userId); $stmt->execute();
-        $delay=random_int(1,4);
-        $stmt=$db->prepare("UPDATE player_orders SET is_fulfilled=1, fulfilled_at=NOW(), next_available_at=DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE player_order_id=? AND user_id=?");
-        $stmt->bind_param('iii',$delay,$orderId,$userId); $stmt->execute();
-        $db->commit(); jsonResponse(['ok'=>true,'message'=>'Order fulfilled. +'.$payment.' coins.']);
+        $repReward = $late ? 0 : (int)($order['reputation_reward'] ?? 1);
+        $recReward = $late ? 0 : (int)($order['recognition_reward'] ?? 0);
+        if ($repReward || $recReward) {
+            $stmt=$db->prepare("UPDATE player_state SET reputation = reputation + ?, recognition = recognition + ? WHERE user_id=?");
+            $stmt->bind_param('iii',$repReward,$recReward,$userId); $stmt->execute();
+        }
+        $stmt=$db->prepare("UPDATE player_orders SET order_status='fulfilled', is_fulfilled=1, fulfilled_at=NOW(), completed_late=? WHERE player_order_id=? AND user_id=?");
+        $lateInt = $late ? 1 : 0;
+        $stmt->bind_param('iii',$lateInt,$orderId,$userId); $stmt->execute();
+        maybeGrantMarketInvite($db, $userId);
+        $db->commit();
+        $msg = $late ? ('Order completed late. +'.$payment.' coins.') : ('Order completed. +'.$payment.' coins. +'.$repReward.' reputation.');
+        jsonResponse(['ok'=>true,'message'=>$msg, 'payment'=>$payment, 'reputation_delta'=>$repReward, 'late'=>$late]);
     }
 
 

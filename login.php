@@ -44,6 +44,6 @@ $authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' . $params;
     <p>Start with dirt. End with suspiciously magical jam.</p>
     <a class="button primary" href="<?= htmlspecialchars($authUrl) ?>">Sign in with Google</a>
   </main>
-  <div class="version-pill"><?= GAME_VERSION ?></div>
+  <div class="version-pill"><?= htmlspecialchars(getAppVersion($db), ENT_QUOTES) ?></div>
 </body>
 </html>

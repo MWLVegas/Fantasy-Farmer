@@ -8,7 +8,7 @@ $userId = requireLogin();
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fantasy Farmer</title>
-  <link rel="stylesheet" href="assets/css/farm.css?v=0.3.15">
+  <link rel="stylesheet" href="assets/css/farm.css?v=0.4.9">
 </head>
 <body>
   <header class="topbar">
@@ -30,6 +30,8 @@ $userId = requireLogin();
       <div class="panel-header">
         <h2 id="gardenName">Garden</h2>
         <span class="panel-coin-pill"><span id="coinCount">0</span> 🪙</span>
+        <span class="panel-stat-pill" data-tooltip-html="<b>Reputation</b><br><span class=&quot;muted-line&quot;>Local trust earned from orders.</span>">⭐ <b id="reputationCount">0</b></span>
+        <span class="panel-stat-pill" data-tooltip-html="<b>Recognition</b><br><span class=&quot;muted-line&quot;>World progress from milestones, relics, and visitors.</span>">🏵️ <b id="recognitionCount">0</b></span>
       </div>
 
       <div class="day-bar-wrap">
@@ -40,7 +42,9 @@ $userId = requireLogin();
       </div>
 
       <div class="field-actions">
-        <button type="button" id="ordersBtn" class="small-button orders-button" data-tooltip-html="<b>No orders are ready</b><br><span class=&quot;muted-line&quot;>Check back soon.</span>">📜 <span id="ordersTimer"></span><b id="ordersBadge" class="order-badge">!</b></button>
+        <button type="button" id="backToMapBtn" class="small-button back-map-button" hidden>🗺️ Back to Map</button>
+        <button type="button" id="inventoryBtn" class="small-button" data-tooltip-html="<b>Inventory</b><br><span class=&quot;muted-line&quot;>Open your backpack.</span>">🎒 Inventory</button>
+        <button type="button" id="ordersBtn" class="small-button orders-button" data-tooltip-html="<b>Orders Board</b><br><span class=&quot;muted-line&quot;>No active orders right now.</span>">📜 Orders: <span id="ordersTimer">0/2</span><b id="ordersBadge" class="order-badge">!</b></button>
       </div>
 
       <div class="canvas-wrap">
@@ -49,15 +53,17 @@ $userId = requireLogin();
     </section>
 
     <aside class="side-panel">
-      <nav class="tabs" aria-label="Game tabs">
-        <button type="button" class="tab-button active" data-tab="garden" data-tip="Garden">🌱</button>
-        <button type="button" class="tab-button" data-tab="shop" data-tip="Shop">🛒</button>
-        <button type="button" class="tab-button" data-tab="shed" data-tip="Shed">🛖</button>
-        <button type="button" class="tab-button" data-tab="workers" data-tip="Goblins">🧌</button>
-        <button type="button" class="tab-button" data-tab="inventory" data-tip="Inventory">🎒</button>
-      </nav>
+      <div class="side-actions">
+        <button type="button" class="small-button back-map-button" data-side-map-button hidden>🗺️ Back to Map</button>
+      </div>
 
-      <section class="tab-panel active" data-panel="garden">
+      <section class="tab-panel active" data-panel="map">
+        <h3>Overhead Map</h3>
+        <p class="hint">Travel between unlocked places. The canvas is now the world hub.</p>
+        <div id="locationList" class="shop-list canvas-only-note"></div>
+      </section>
+
+      <section class="tab-panel" data-panel="garden">
         <h3>Tools</h3>
         <div id="toolGrid" class="icon-grid"></div>
 
@@ -80,13 +86,19 @@ $userId = requireLogin();
         <div id="processingList" class="shop-list"></div>
       </section>
 
-      <section class="tab-panel" data-panel="workers">
-        <h3>Hire Goblins</h3>
-        <div id="workerHireList" class="shop-list"></div>
-        <h3>Your Crew</h3>
+      <section class="tab-panel" data-panel="orders">
+        <h3>Orders Board</h3>
+        <p class="hint">Multiple requests can be active at once. Shorter timers pay a rush bonus.</p>
+        <div id="ordersBoardList" class="shop-list canvas-only-note"></div>
+      </section>
+
+      <section class="tab-panel" data-panel="helpers">
+        <h3>Forest Folk</h3>
+        <div id="helperUnlockHint" class="hint"></div>
+        <h3>Your Helpers</h3>
         <div id="workerList" class="shop-list"></div>
-        <h3>Plant Order</h3>
-        <p class="hint">Planter goblins will try this order from top to bottom.</p>
+        <h3>Future Task Plan</h3>
+        <p class="hint">Fairies and other forest folk will use equipped charms or amulets to choose their automation.</p>
         <div id="plantOrderList" class="shop-list"></div>
       </section>
 
@@ -107,20 +119,34 @@ $userId = requireLogin();
   <div id="ordersModal" class="modal closeableModal">
     <div class="modal-content modal-content--orders">
       <div class="modal-header">
-        <h2>Orders</h2>
+        <h2>Order Details</h2>
         <button type="button" class="modal-close" data-close-modal>×</button>
       </div>
       <div id="ordersContent"></div>
     </div>
   </div>
 
+
+  <div id="storyModal" class="modal closeableModal">
+    <div class="modal-content modal-content--story">
+      <div class="modal-header">
+        <h2 id="storyTitle">Story</h2>
+        <button type="button" id="storyCloseBtn" class="modal-close" data-close-modal hidden>×</button>
+      </div>
+      <div id="storyContent" class="story-content"></div>
+      <div class="story-actions">
+        <button type="button" id="storyNextBtn" class="button primary">Okay</button>
+      </div>
+    </div>
+  </div>
+
   <div id="gameTooltip" class="game-tooltip"></div>
   <div id="statusMessage" class="status-message"></div>
-  <div class="version-pill"><?= GAME_VERSION ?></div>
+  <div class="version-pill" id="versionPill"><?= htmlspecialchars(getAppVersion($db), ENT_QUOTES) ?></div>
 
   <script>
-    window.GAME_VERSION = <?= json_encode(GAME_VERSION) ?>;
+    window.GAME_VERSION = <?= json_encode(getAppVersion($db)) ?>;
   </script>
-  <script src="assets/js/farm.js?v=0.3.15"></script>
+  <script src="assets/js/farm.js?v=0.4.9"></script>
 </body>
 </html>
