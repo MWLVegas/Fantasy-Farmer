@@ -8,7 +8,7 @@ $userId = requireLogin();
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fantasy Farmer</title>
-  <link rel="stylesheet" href="assets/css/farm.css?v=0.4.9">
+  <link rel="stylesheet" href="assets/css/farm.css?v=0.4.16g">
 </head>
 <body>
   <header class="topbar">
@@ -27,13 +27,6 @@ $userId = requireLogin();
 
   <main class="game-shell">
     <section class="play-panel">
-      <div class="panel-header">
-        <h2 id="gardenName">Garden</h2>
-        <span class="panel-coin-pill"><span id="coinCount">0</span> 🪙</span>
-        <span class="panel-stat-pill" data-tooltip-html="<b>Reputation</b><br><span class=&quot;muted-line&quot;>Local trust earned from orders.</span>">⭐ <b id="reputationCount">0</b></span>
-        <span class="panel-stat-pill" data-tooltip-html="<b>Recognition</b><br><span class=&quot;muted-line&quot;>World progress from milestones, relics, and visitors.</span>">🏵️ <b id="recognitionCount">0</b></span>
-      </div>
-
       <div class="day-bar-wrap">
         <div class="day-label" id="dayLabel">Day 1 · 06:00</div>
         <div class="day-track">
@@ -42,23 +35,31 @@ $userId = requireLogin();
       </div>
 
       <div class="field-actions">
-        <button type="button" id="backToMapBtn" class="small-button back-map-button" hidden>🗺️ Back to Map</button>
-        <button type="button" id="inventoryBtn" class="small-button" data-tooltip-html="<b>Inventory</b><br><span class=&quot;muted-line&quot;>Open your backpack.</span>">🎒 Inventory</button>
-        <button type="button" id="ordersBtn" class="small-button orders-button" data-tooltip-html="<b>Orders Board</b><br><span class=&quot;muted-line&quot;>No active orders right now.</span>">📜 Orders: <span id="ordersTimer">0/2</span><b id="ordersBadge" class="order-badge">!</b></button>
+        <div class="field-stats" aria-label="Farm totals">
+          <span class="panel-coin-pill" data-tooltip-html="<b>Coins</b><br><span class=&quot;muted-line&quot;>Spendable money from farming, sales, and completed orders.</span>"><span id="coinIcon" class="header-stat-icon">🪙</span><span id="coinCount">0</span></span>
+          <span class="panel-stat-pill" data-tooltip-html="<b>Reputation</b><br><span class=&quot;muted-line&quot;>Local trust earned from orders.</span>"><span id="reputationIcon" class="header-stat-icon">⭐</span> <b id="reputationCount">0</b></span>
+          <span class="panel-stat-pill" data-tooltip-html="<b>Recognition</b><br><span class=&quot;muted-line&quot;>World progress from milestones, relics, and visitors.</span>"><span id="recognitionIcon" class="header-stat-icon">🏵️</span> <b id="recognitionCount">0</b></span>
+        </div>
+        <div class="field-nav-actions">
+          <button type="button" id="backToMapBtn" class="small-button back-map-button" hidden>🗺️ Map</button>
+          <button type="button" id="inventoryBtn" class="small-button" data-tooltip-html="<b>Inventory</b><br><span class=&quot;muted-line&quot;>Open your backpack.</span>">🎒 Backpack</button>
+          <button type="button" id="ordersBtn" class="small-button orders-button" data-tooltip-html="<b>Orders Board</b><br><span class=&quot;muted-line&quot;>No active orders right now.</span>">📜 Orders: <span id="ordersTimer">0/2</span><b id="ordersBadge" class="order-badge">!</b></button>
+        </div>
       </div>
 
       <div class="canvas-wrap">
         <canvas id="gardenCanvas" width="720" height="720"></canvas>
+        <div id="ordersBoardSurface" class="orders-board-surface" hidden></div>
       </div>
     </section>
 
     <aside class="side-panel">
       <div class="side-actions">
-        <button type="button" class="small-button back-map-button" data-side-map-button hidden>🗺️ Back to Map</button>
+        <button type="button" class="small-button back-map-button" data-side-map-button hidden>🗺️ Map</button>
       </div>
 
       <section class="tab-panel active" data-panel="map">
-        <h3>Overhead Map</h3>
+        <h3 id="mapPanelTitle">Town</h3>
         <p class="hint">Travel between unlocked places. The canvas is now the world hub.</p>
         <div id="locationList" class="shop-list canvas-only-note"></div>
       </section>
@@ -97,8 +98,6 @@ $userId = requireLogin();
         <div id="helperUnlockHint" class="hint"></div>
         <h3>Your Helpers</h3>
         <div id="workerList" class="shop-list"></div>
-        <h3>Future Task Plan</h3>
-        <p class="hint">Fairies and other forest folk will use equipped charms or amulets to choose their automation.</p>
         <div id="plantOrderList" class="shop-list"></div>
       </section>
 
@@ -106,7 +105,7 @@ $userId = requireLogin();
         <h3>Admin Debug</h3>
         <p class="hint">Visible only to the configured admin user.</p>
         <div class="shop-list">
-          <button type="button" id="adminAddCoinsBtn">➕ 1000 🪙</button>
+          <button type="button" id="adminAddCoinsBtn">➕ 1000 <span class="admin-coin-icon">🪙</span></button>
         </div>
       </section>
 
@@ -142,11 +141,12 @@ $userId = requireLogin();
 
   <div id="gameTooltip" class="game-tooltip"></div>
   <div id="statusMessage" class="status-message"></div>
+  <div id="saveStatus" class="save-status save-status--saved" data-tooltip-html="<b>Save Status</b><br>Everything is synced.">●●</div>
   <div class="version-pill" id="versionPill"><?= htmlspecialchars(getAppVersion($db), ENT_QUOTES) ?></div>
 
   <script>
     window.GAME_VERSION = <?= json_encode(getAppVersion($db)) ?>;
   </script>
-  <script src="assets/js/farm.js?v=0.4.9"></script>
+  <script src="assets/js/farm.js?v=0.4.16g"></script>
 </body>
 </html>

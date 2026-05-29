@@ -7,7 +7,7 @@ require_once __DIR__ . '/../db_connect.php';
 require_once __DIR__ . '/farm_functions.php';
 require_once __DIR__ . '/auth.php';
 
-const GAME_VERSION = 'v0.4.9';
+const GAME_VERSION = 'v0.4.16g';
 
 function jsonResponse(array $data, int $status = 200): void
 {

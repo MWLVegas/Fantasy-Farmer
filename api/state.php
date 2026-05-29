@@ -5,6 +5,7 @@ $userId = requireLogin();
 ensurePlayerDefaults($db, $userId);
 ensureActiveOrder($db, $userId);
 processGrowth($db, $userId);
+processHelperAutomation($db, $userId);
 
 $stmt = $db->prepare("SELECT user_id, display_name, coins, energy FROM users WHERE user_id = ? LIMIT 1");
 $stmt->bind_param('i', $userId);
@@ -36,7 +37,7 @@ $plots = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->prepare("
     SELECT pc.*, p.name, p.code, p.width, p.height, p.growth_steps, p.cycle_hour, p.water_max, p.water_required,
-           p.stage_icons_json, hi.icon AS mature_icon, si.icon AS seed_icon, p.harvest_item_id
+           p.stage_icons_json, p.harvest_min, p.harvest_max, hi.icon AS mature_icon, si.icon AS seed_icon, p.harvest_item_id
     FROM planted_crops pc
     JOIN plants p ON p.plant_id = pc.plant_id
     JOIN items hi ON hi.item_id = p.harvest_item_id
@@ -48,10 +49,11 @@ $stmt->execute();
 $crops = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->query("
-    SELECT p.plant_id, p.code, p.name, p.width, p.height,
-           i.icon AS seed_icon, p.seed_item_id, i.base_buy_price, i.name AS seed_name
+    SELECT p.plant_id, p.code, p.name, p.width, p.height, p.growth_steps, p.water_max, p.harvest_min, p.harvest_max,
+           hi.icon AS mature_icon, i.icon AS seed_icon, p.seed_item_id, i.base_buy_price, i.name AS seed_name
     FROM plants p
     JOIN items i ON i.item_id = p.seed_item_id
+    JOIN items hi ON hi.item_id = p.harvest_item_id
     WHERE p.is_active = 1
     ORDER BY i.base_buy_price ASC
 ");
@@ -96,6 +98,65 @@ $stmt->bind_param('i', $userId);
 $stmt->execute();
 $machines = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
+$shedZones = [];
+$shedPlaceables = [];
+$shedObjects = [];
+$shedStations = [];
+$shedBackground = '';
+$hasShedTables = false;
+try {
+    $res = $db->query("SELECT COUNT(*) AS c FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'player_shed_objects'");
+    $hasShedTables = $res && (int)($res->fetch_assoc()['c'] ?? 0) > 0;
+} catch (Throwable $e) {
+    $hasShedTables = false;
+}
+if ($hasShedTables) {
+    try {
+        $cfg = getGameConfig($db);
+        $shedBackground = $cfg['shed_background_image'] ?? '';
+    } catch (Throwable $e) {
+        $shedBackground = '';
+    }
+    $res = $db->query("SELECT * FROM shed_zones WHERE is_active = 1 ORDER BY sort_order ASC, zone_key ASC");
+    if ($res) $shedZones = $res->fetch_all(MYSQLI_ASSOC);
+    $res = $db->query("SELECT * FROM placeable_defs WHERE is_active = 1 ORDER BY sort_order ASC, display_name ASC");
+    if ($res) $shedPlaceables = $res->fetch_all(MYSQLI_ASSOC);
+    $stmt = $db->prepare("
+        SELECT pso.*, pd.placeable_key, pd.display_name, pd.icon_path, pd.grid_w, pd.grid_h, pd.can_rotate, pd.category,
+               pm.machine_id, m.machine_type, m.name AS machine_name, m.icon AS machine_icon
+        FROM player_shed_objects pso
+        JOIN placeable_defs pd ON pd.placeable_id = pso.placeable_id
+        LEFT JOIN player_machines pm ON pm.player_machine_id = pso.player_machine_id
+        LEFT JOIN machines m ON m.machine_id = pm.machine_id
+        WHERE pso.user_id = ? AND pso.is_active = 1
+        ORDER BY pso.zone_key, pso.z_index, pso.shed_object_id
+    ");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $shedObjects = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+    try {
+        $res = $db->query("SELECT COUNT(*) AS c FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'shed_station_config'");
+        $hasStations = $res && (int)($res->fetch_assoc()['c'] ?? 0) > 0;
+    } catch (Throwable $e) {
+        $hasStations = false;
+    }
+    if ($hasStations) {
+        $stmt = $db->prepare("
+            SELECT s.*, m.machine_id, m.name AS machine_name, m.icon AS machine_icon, m.base_cost,
+                   COALESCE(pm.quantity, 0) AS owned_quantity
+            FROM shed_station_config s
+            LEFT JOIN machines m ON m.machine_type = s.machine_type AND m.is_active = 1
+            LEFT JOIN player_machines pm ON pm.machine_id = m.machine_id AND pm.user_id = ?
+            WHERE s.is_active = 1
+            ORDER BY s.sort_order ASC, s.station_key ASC
+        " );
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $shedStations = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    }
+}
+
 $stmt = $db->query("SELECT * FROM machines WHERE is_active = 1 ORDER BY base_cost ASC");
 $allMachines = $stmt->fetch_all(MYSQLI_ASSOC);
 
@@ -112,7 +173,7 @@ $stmt = $db->query("
 $recipes = $stmt->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->prepare("
-    SELECT j.*, r.output_item_id, r.output_quantity, oi.name AS output_name, oi.icon AS output_icon
+    SELECT j.*, r.machine_type, r.output_item_id, r.output_quantity, oi.name AS output_name, oi.icon AS output_icon
     FROM processing_jobs j
     JOIN processing_recipes r ON r.recipe_id = j.recipe_id
     JOIN items oi ON oi.item_id = r.output_item_id
@@ -165,6 +226,12 @@ $order = $orders[0] ?? null;
 $orderItems = $order ? ($orderItemsByOrder[(int)$order['player_order_id']] ?? []) : [];
 $orderSlotLimit = getOrderSlotLimit($db, $userId);
 $availableOrderLimit = getAvailableOrderLimit($db);
+$shopSellLimits = getShopSellLimits($db, $userId);
+$marketStatus = getMarketStatus($db, $userId);
+$stmt = $db->prepare("SELECT COUNT(*) AS purchase_count FROM player_unlocks WHERE user_id = ? AND unlock_key LIKE 'shop_land_claim_note_%'");
+$stmt->bind_param('i', $userId);
+$stmt->execute();
+$landClaimShopPurchases = (int)($stmt->get_result()->fetch_assoc()['purchase_count'] ?? 0);
 
 $progress = getPlayerProgress($db, $userId);
 maybeGrantMarketInvite($db, $userId);
@@ -183,9 +250,30 @@ $stmt->execute();
 $relics = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $helperEquipment = $db->query("SELECT * FROM helper_equipment WHERE is_active = 1 ORDER BY sort_order ASC, name ASC")->fetch_all(MYSQLI_ASSOC);
+$helperAccessories = [];
+try {
+    $stmt = $db->prepare("
+        SELECT he.*, i.item_id, i.name AS item_name, i.icon AS item_icon, COALESCE(inv.quantity,0) AS owned_quantity,
+               (SELECT COUNT(*) FROM player_helpers ph2 WHERE ph2.user_id = ? AND ph2.equipped_helper_equipment_id = he.helper_equipment_id) AS equipped_count
+        FROM helper_equipment he
+        LEFT JOIN items i ON i.code = he.code AND i.item_type = 'helper_equipment'
+        LEFT JOIN player_inventory inv ON inv.item_id = i.item_id AND inv.user_id = ?
+        WHERE he.is_active = 1
+          AND (COALESCE(inv.quantity,0) > 0 OR EXISTS (
+              SELECT 1 FROM player_helpers ph3
+              WHERE ph3.user_id = ? AND ph3.equipped_helper_equipment_id = he.helper_equipment_id
+          ))
+        ORDER BY he.sort_order ASC, he.name ASC
+    " );
+    $stmt->bind_param('iii', $userId, $userId, $userId);
+    $stmt->execute();
+    $helperAccessories = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+} catch (Throwable $e) {
+    $helperAccessories = $helperEquipment;
+}
 $helperTypes = $db->query("SELECT * FROM helper_types WHERE is_active = 1 ORDER BY sort_order ASC, name ASC")->fetch_all(MYSQLI_ASSOC);
 $stmt = $db->prepare("
-    SELECT ph.*, ht.name, ht.species_key, ht.icon, he.name AS equipment_name, he.task_type
+    SELECT ph.*, ht.name, ht.species_key, ht.icon, he.name AS equipment_name, he.icon AS equipment_icon, he.task_type
     FROM player_helpers ph
     JOIN helper_types ht ON ht.helper_type_id = ph.helper_type_id
     LEFT JOIN helper_equipment he ON he.helper_equipment_id = ph.equipped_helper_equipment_id
@@ -227,6 +315,9 @@ jsonResponse([
     'version' => getAppVersion($db),
     'clock' => getGameClock($db, $userId),
     'shop_refresh' => getShopRefresh($db, $userId),
+    'market_status' => $marketStatus,
+    'shop_sell_limits' => $shopSellLimits,
+    'land_claim_shop_purchases' => $landClaimShopPurchases,
     'user' => array_merge($user, $progress),
     'progress' => $progress,
     'unlocks' => $unlocks,
@@ -235,8 +326,10 @@ jsonResponse([
     'relics' => $relics,
     'relic_pickup' => $relicPickup,
     'story_event' => $storyEvent,
+    'location_events' => getLocationEvents($db, $userId),
     'helper_types' => $helperTypes,
     'helper_equipment' => $helperEquipment,
+    'helper_accessories' => $helperAccessories,
     'is_admin' => isAdminUser($db, $userId),
     'garden' => $garden,
     'plots' => $plots,
@@ -245,6 +338,13 @@ jsonResponse([
     'inventory' => $inventory,
     'tools' => $tools,
     'machines' => $machines,
+    'shed' => [
+        'background_image' => $shedBackground,
+        'zones' => $shedZones,
+        'placeables' => $shedPlaceables,
+        'objects' => $shedObjects,
+        'stations' => $shedStations
+    ],
     'all_machines' => $allMachines,
     'all_tools' => $allTools,
     'recipes' => $recipes,

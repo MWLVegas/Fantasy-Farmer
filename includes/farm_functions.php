@@ -34,9 +34,48 @@ function getAppVersion(mysqli $db): string
 function getMapConfig(mysqli $db): array
 {
     $config = getGameConfig($db);
+    $markers = [];
+
+    $hasMarkerTable = false;
+    try {
+        $res = $db->query("SELECT COUNT(*) AS c FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'map_location_config'");
+        $hasMarkerTable = $res && (int)($res->fetch_assoc()['c'] ?? 0) > 0;
+    } catch (Throwable $e) {
+        $hasMarkerTable = false;
+    }
+
+    if ($hasMarkerTable) {
+        $select = "location_key, map_x, map_y, map_icon";
+        $select .= columnExists($db, 'map_location_config', 'icon_size') ? ", icon_size" : ", NULL AS icon_size";
+        $select .= columnExists($db, 'map_location_config', 'glow_color') ? ", glow_color" : ", NULL AS glow_color";
+        $select .= columnExists($db, 'map_location_config', 'side_menu_html') ? ", side_menu_html" : ", NULL AS side_menu_html";
+        $res = $db->query("SELECT {$select} FROM map_location_config WHERE is_active = 1 ORDER BY sort_order ASC, location_key ASC");
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                $markers[$row['location_key']] = [
+                    'x' => (int)$row['map_x'],
+                    'y' => (int)$row['map_y'],
+                    'icon' => $row['map_icon'] ?? '',
+                    'size' => (int)($row['icon_size'] ?? 78),
+                    'glow_color' => $row['glow_color'] ?? 'rgba(255, 214, 94, .78)',
+                    'side_menu_html' => $row['side_menu_html'] ?? null
+                ];
+            }
+        }
+    }
+
+    $sideMenus = [];
+    foreach ($markers as $key => $marker) {
+        if (!empty($marker['side_menu_html'])) $sideMenus[$key] = $marker['side_menu_html'];
+    }
+
     return [
+        'title' => $config['map_title'] ?? 'Town',
         'background_image' => $config['map_background_image'] ?? '',
-        'button_positions_json' => $config['map_button_positions_json'] ?? ''
+        'button_positions_json' => $config['map_button_positions_json'] ?? '',
+        'side_menu' => $config['map_side_menu_html'] ?? '',
+        'side_menus' => $sideMenus,
+        'location_markers' => $markers
     ];
 }
 
@@ -52,12 +91,18 @@ function getGameClock(mysqli $db, int $userId): array
     $elapsed = max(0, time() - $startedAt);
     $dayLength = max(60, (int) $config['day_length_seconds']);
     $dayFloat = $elapsed / $dayLength;
-    $day = (int) floor($dayFloat) + 1;
+    $absoluteDay = (int) floor($dayFloat) + 1;
+    $yearLength = max(30, (int)($config['year_length_days'] ?? 300));
+    $year = (int) floor(($absoluteDay - 1) / $yearLength) + 1;
+    $day = (($absoluteDay - 1) % $yearLength) + 1;
     $dayProgress = $dayFloat - floor($dayFloat);
     $mins = (int) floor($dayProgress * 1440);
 
     return [
         'day_length_seconds' => $dayLength,
+        'year_length_days' => $yearLength,
+        'absolute_day' => $absoluteDay,
+        'year' => $year,
         'day' => $day,
         'hour' => (int) floor($mins / 60),
         'minute' => $mins % 60,
@@ -239,6 +284,154 @@ function processGrowth(mysqli $db, int $userId): void
         $cropId = (int) $crop['planted_crop_id'];
         $stmt->bind_param('iiiii', $water, $step, $lastCycle, $cropId, $userId);
         $stmt->execute();
+    }
+}
+
+
+function processHelperAutomation(mysqli $db, int $userId): void
+{
+    $ready = $db->query("SELECT COUNT(*) AS c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'player_helpers' AND COLUMN_NAME = 'last_action_at'");
+    if (!$ready || (int)($ready->fetch_assoc()['c'] ?? 0) === 0) return;
+
+    $stmt = $db->prepare("\n        SELECT ph.*, he.code AS equipment_code, he.task_type\n        FROM player_helpers ph\n        JOIN helper_equipment he ON he.helper_equipment_id = ph.equipped_helper_equipment_id\n        WHERE ph.user_id = ?\n          AND ph.is_enabled = 1\n          AND he.is_active = 1\n          AND COALESCE(ph.active_task, he.task_type, 'idle') <> 'idle'\n    ");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $helpers = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    if (!$helpers) return;
+
+    $garden = null;
+    $stmt = $db->prepare("SELECT garden_id FROM gardens WHERE user_id = ? ORDER BY garden_id ASC LIMIT 1");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $garden = $stmt->get_result()->fetch_assoc();
+    if (!$garden) return;
+    $gardenId = (int)$garden['garden_id'];
+
+    foreach ($helpers as $helper) {
+        $last = !empty($helper['last_action_at']) ? strtotime($helper['last_action_at']) : 0;
+        $speed = max(1, (int)($helper['speed_rating'] ?? 10));
+        $effectiveness = max(1, (int)($helper['effectiveness_rating'] ?? 10));
+        // Helpers should feel useful, but still weaker than hands-on play.
+        // Speed shortens the delay between helper actions instead of making them spam instantly.
+        $cooldown = max(12, 40 - (int)floor($speed * 1.5));
+        if ($last && time() - $last < $cooldown) continue;
+
+        $helperId = (int)$helper['player_helper_id'];
+        $task = (string)($helper['task_type'] ?: $helper['active_task']);
+        $didWork = false;
+        $targetX = null;
+        $targetY = null;
+
+        if ($task === 'water') {
+            $toolStrength = 15;
+            $stmt = $db->prepare("
+                SELECT t.strength
+                FROM player_tools pt
+                JOIN tools t ON t.tool_id = pt.tool_id
+                WHERE pt.user_id = ? AND t.tool_type = 'watering_can'
+                ORDER BY t.level DESC
+                LIMIT 1
+            " );
+            $stmt->bind_param('i', $userId);
+            $stmt->execute();
+            $tool = $stmt->get_result()->fetch_assoc();
+            if ($tool) $toolStrength = max(1, (int)$tool['strength']);
+
+            // Water fairy output follows the player's can, but stays a bit weaker than manual watering.
+            $amount = max(8, (int)floor(($toolStrength * 0.70) + ($effectiveness * 0.20)));
+            $stmt = $db->prepare("
+                SELECT pc.planted_crop_id, pc.origin_x, pc.origin_y
+                FROM planted_crops pc
+                JOIN plants p ON p.plant_id = pc.plant_id
+                WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0
+                  AND pc.water_current < p.water_max
+                ORDER BY (pc.water_current / NULLIF(p.water_max, 0)) ASC, pc.planted_crop_id ASC
+                LIMIT 1
+            " );
+            $stmt->bind_param('ii', $userId, $gardenId);
+            $stmt->execute();
+            $crop = $stmt->get_result()->fetch_assoc();
+            if ($crop) {
+                $cropId = (int)$crop['planted_crop_id'];
+                $stmt = $db->prepare("
+                    UPDATE planted_crops pc
+                    JOIN plants p ON p.plant_id = pc.plant_id
+                    SET pc.water_current = LEAST(p.water_max, pc.water_current + ?)
+                    WHERE pc.planted_crop_id = ? AND pc.user_id = ?
+                      AND pc.is_harvested = 0
+                      AND pc.water_current < p.water_max
+                " );
+                $stmt->bind_param('iii', $amount, $cropId, $userId);
+                $stmt->execute();
+                $didWork = $stmt->affected_rows > 0;
+                $targetX = (int)$crop['origin_x'];
+                $targetY = (int)$crop['origin_y'];
+            }
+        } elseif ($task === 'till') {
+            $amount = max(4, (int)floor($effectiveness * 0.6));
+            $stmt = $db->prepare("\n                SELECT plot_id, x_pos, y_pos\n                FROM garden_plots\n                WHERE garden_id = ? AND is_unlocked = 1 AND is_tilled = 0\n                ORDER BY y_pos ASC, x_pos ASC\n                LIMIT 1\n            ");
+            $stmt->bind_param('i', $gardenId);
+            $stmt->execute();
+            $plot = $stmt->get_result()->fetch_assoc();
+            if ($plot) {
+                $plotId = (int)$plot['plot_id'];
+                $stmt = $db->prepare("\n                    UPDATE garden_plots\n                    SET till_progress = LEAST(100, till_progress + ?),\n                        is_tilled = CASE WHEN LEAST(100, till_progress + ?) >= 100 THEN 1 ELSE is_tilled END\n                    WHERE plot_id = ?\n                ");
+                $stmt->bind_param('iii', $amount, $amount, $plotId);
+                $stmt->execute();
+                $didWork = $stmt->affected_rows >= 0;
+                $targetX = (int)$plot['x_pos'];
+                $targetY = (int)$plot['y_pos'];
+            }
+        } elseif ($task === 'harvest') {
+            $stmt = $db->prepare("\n                SELECT pc.planted_crop_id, pc.origin_x, pc.origin_y, p.harvest_item_id, p.harvest_min\n                FROM planted_crops pc\n                JOIN plants p ON p.plant_id = pc.plant_id\n                WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0\n                  AND pc.growth_step_current >= p.growth_steps\n                ORDER BY pc.planted_crop_id ASC\n                LIMIT 1\n            ");
+            $stmt->bind_param('ii', $userId, $gardenId);
+            $stmt->execute();
+            $crop = $stmt->get_result()->fetch_assoc();
+            if ($crop) {
+                addInventory($db, $userId, (int)$crop['harvest_item_id'], max(1, (int)$crop['harvest_min']));
+                $cropId = (int)$crop['planted_crop_id'];
+                $stmt = $db->prepare("UPDATE planted_crops SET is_harvested = 1 WHERE planted_crop_id = ? AND user_id = ?");
+                $stmt->bind_param('ii', $cropId, $userId);
+                $stmt->execute();
+                $didWork = true;
+                $targetX = (int)$crop['origin_x'];
+                $targetY = (int)$crop['origin_y'];
+            }
+        } elseif ($task === 'plant') {
+            $stmt = $db->prepare("\n                SELECT p.*\n                FROM plants p\n                JOIN player_inventory inv ON inv.item_id = p.seed_item_id AND inv.user_id = ? AND inv.quantity > 0\n                WHERE p.is_active = 1\n                ORDER BY p.base_buy_price ASC, p.plant_id ASC\n                LIMIT 1\n            ");
+            $stmt->bind_param('i', $userId);
+            $stmt->execute();
+            $plant = $stmt->get_result()->fetch_assoc();
+            if ($plant) {
+                $stmt = $db->prepare("\n                    SELECT gp.x_pos, gp.y_pos\n                    FROM garden_plots gp\n                    WHERE gp.garden_id = ? AND gp.is_unlocked = 1 AND gp.is_tilled = 1\n                    ORDER BY gp.y_pos ASC, gp.x_pos ASC\n                ");
+                $stmt->bind_param('i', $gardenId);
+                $stmt->execute();
+                $plots = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+                foreach ($plots as $plot) {
+                    $place = canPlacePlant($db, $gardenId, (int)$plant['plant_id'], (int)$plot['x_pos'], (int)$plot['y_pos']);
+                    if (!$place['ok']) continue;
+                    if (!removeInventory($db, $userId, (int)$plant['seed_item_id'], 1)) break;
+                    $x = (int)$plot['x_pos'];
+                    $y = (int)$plot['y_pos'];
+                    $stmt = $db->prepare("INSERT INTO planted_crops (user_id, garden_id, plant_id, origin_x, origin_y, water_current) VALUES (?, ?, ?, ?, ?, 0)");
+                    $plantId = (int)$plant['plant_id'];
+                    $stmt->bind_param('iiiii', $userId, $gardenId, $plantId, $x, $y);
+                    $stmt->execute();
+                    $didWork = true;
+                    $targetX = $x;
+                    $targetY = $y;
+                    break;
+                }
+            }
+        }
+
+        if ($didWork) {
+            $xRatio = $targetX === null ? random_int(3000, 7000) / 10000 : min(.92, max(.08, .18 + ($targetX * .08)));
+            $yRatio = $targetY === null ? random_int(3000, 7000) / 10000 : min(.92, max(.08, .18 + ($targetY * .08)));
+            $stmt = $db->prepare("UPDATE player_helpers SET last_action_at = NOW(), x_ratio = ?, y_ratio = ? WHERE player_helper_id = ? AND user_id = ?");
+            $stmt->bind_param('ddii', $xRatio, $yRatio, $helperId, $userId);
+            $stmt->execute();
+        }
     }
 }
 
@@ -500,7 +693,7 @@ function ensureActiveOrders(mysqli $db, int $userId): void
     $nextOrderAt = $row['next_order_at'] ?? null;
 
     if (!$nextOrderAt) {
-        $delay = randomMinuteRange($config, 'order_refill_min_minutes', 'order_refill_max_minutes', 2, 5);
+        $delay = randomMinuteRange($config, 'order_refill_min_minutes', 'order_refill_max_minutes', 1, 1);
         $stmt = $db->prepare("UPDATE player_state SET next_order_at = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE user_id = ?");
         $stmt->bind_param('ii', $delay, $userId);
         $stmt->execute();
@@ -515,7 +708,7 @@ function ensureActiveOrders(mysqli $db, int $userId): void
     $available++;
 
     if ($available < $availableLimit) {
-        $delay = randomMinuteRange($config, 'order_refill_min_minutes', 'order_refill_max_minutes', 2, 5);
+        $delay = randomMinuteRange($config, 'order_refill_min_minutes', 'order_refill_max_minutes', 1, 1);
         $stmt = $db->prepare("UPDATE player_state SET next_order_at = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE user_id = ?");
         $stmt->bind_param('ii', $delay, $userId);
     } else {
@@ -570,6 +763,75 @@ function createRandomOrder(mysqli $db, int $userId): void
     $stmt->execute();
 }
 
+
+function getMarketStatus(mysqli $db, int $userId): array
+{
+    $clock = getGameClock($db, $userId);
+    $absoluteDay = max(1, (int)($clock['absolute_day'] ?? 1));
+    $hour = (int)($clock['hour'] ?? 0);
+    $minute = (int)($clock['minute'] ?? 0);
+    $secondsIntoDay = ($hour * 3600) + ($minute * 60);
+    $dayLength = max(60, (int)($clock['day_length_seconds'] ?? 720));
+    $weekDay = (($absoluteDay - 1) % 7) + 1; // 6 and 7 are the weekend market days.
+    $openHour = 7;
+    $closeHour = 18;
+    $isWeekend = $weekDay >= 6;
+    $isOpenHours = $hour >= $openHour && $hour < $closeHour;
+    $isOpen = $isWeekend && $isOpenHours;
+
+    $openOffset = (int)round(($openHour / 24) * $dayLength);
+    $closeOffset = (int)round(($closeHour / 24) * $dayLength);
+    $currentOffset = (int)round((($hour * 60 + $minute) / 1440) * $dayLength);
+
+    if ($isOpen) {
+        $secondsRemaining = max(0, $closeOffset - $currentOffset);
+        $label = 'Market closes';
+    } else {
+        $daysUntilMarket = 0;
+        if ($weekDay <= 5) $daysUntilMarket = 6 - $weekDay;
+        elseif ($weekDay === 6 && $hour >= $closeHour) $daysUntilMarket = 1;
+        elseif ($weekDay === 7 && $hour >= $closeHour) $daysUntilMarket = 6;
+        elseif ($weekDay === 7) $daysUntilMarket = 0;
+
+        $targetOffset = $openOffset;
+        $secondsRemaining = ($daysUntilMarket * $dayLength) + $targetOffset - $currentOffset;
+        if ($secondsRemaining < 0) $secondsRemaining += $dayLength;
+        $label = 'Market opens';
+    }
+
+    return [
+        'is_open' => $isOpen,
+        'is_weekend' => $isWeekend,
+        'weekday' => $weekDay,
+        'open_hour' => $openHour,
+        'close_hour' => $closeHour,
+        'label' => $label,
+        'seconds_remaining' => $secondsRemaining
+    ];
+}
+
+function getShopSellLimits(mysqli $db, int $userId): array
+{
+    if (!tableExists($db, 'shop_buy_limits')) return [];
+    $clock = getGameClock($db, $userId);
+    $shopDay = (int)($clock['absolute_day'] ?? 1);
+    $stmt = $db->prepare("\n        SELECT i.item_id, i.code, i.name, i.icon, i.base_sell_price, sbl.daily_limit,\n               COALESCE(sold.quantity_sold, 0) AS quantity_sold,\n               GREATEST(0, sbl.daily_limit - COALESCE(sold.quantity_sold, 0)) AS remaining_quantity\n        FROM shop_buy_limits sbl\n        JOIN items i ON i.item_id = sbl.item_id\n        LEFT JOIN player_shop_sales sold\n          ON sold.user_id = ? AND sold.item_id = i.item_id AND sold.shop_day = ?\n        WHERE sbl.is_active = 1 AND i.is_active = 1\n        ORDER BY i.base_sell_price ASC, i.name ASC\n    ");
+    if (!$stmt) return [];
+    $stmt->bind_param('ii', $userId, $shopDay);
+    if (!@$stmt->execute()) return [];
+    return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+}
+
+function eventHasFirstStep(mysqli $db, string $eventKey): bool
+{
+    if (!tableExists($db, 'events') || !tableExists($db, 'event_steps')) return false;
+    $stmt = $db->prepare("\n        SELECT e.event_id\n        FROM events e\n        JOIN event_steps es ON es.event_id = e.event_id AND es.step_order = 1\n        WHERE e.event_key = ? AND e.is_active = 1\n        LIMIT 1\n    ");
+    if (!$stmt) return false;
+    $stmt->bind_param('s', $eventKey);
+    if (!@$stmt->execute()) return false;
+    return (bool)$stmt->get_result()->fetch_assoc();
+}
+
 function getLocationsForPlayer(mysqli $db, int $userId): array
 {
     $progress = getPlayerProgress($db, $userId);
@@ -581,32 +843,82 @@ function getLocationsForPlayer(mysqli $db, int $userId): array
     while ($row = $res->fetch_assoc()) $unlocks[$row['unlock_key']] = true;
 
     $defs = [
-        ['key'=>'garden','name'=>'Garden','icon'=>'🌱','unlock'=>'location_garden','hint'=>'Your growing field.'],
-        ['key'=>'shop','name'=>'General Store','icon'=>'🏪','unlock'=>'location_shop','hint'=>'Basic seeds, tools, and a weekly special.'],
-        ['key'=>'orders','name'=>'Orders Board','icon'=>'📜','unlock'=>'orders_board','hint'=>'Requests from townsfolk.'],
+        ['key'=>'garden','name'=>'Garden','icon'=>'assets/map/garden.png','unlock'=>'location_garden','hint'=>'Your growing field.'],
+        ['key'=>'shop','name'=>'General Store','icon'=>'assets/map/store.png','unlock'=>'location_shop','hint'=>'Basic seeds, tools, and a weekly special.'],
+        ['key'=>'orders','name'=>'Orders Board','icon'=>'assets/map/orders.png','unlock'=>'orders_board','hint'=>'Requests from townsfolk.'],
         ['key'=>'shed','name'=>'Workroom / Shed','icon'=>'🛖','unlock'=>'location_shed','hint'=>'Processing and equipment live here.'],
         ['key'=>'market','name'=>'Farmer\'s Market','icon'=>'🎪','unlock'=>'location_market','hint'=>'Unlocks at 10 reputation after the shopkeeper invite.'],
-        ['key'=>'caravan','name'=>'Caravan Camp','icon'=>'🔮','unlock'=>'location_caravan','hint'=>'Unlocked by relic-driven visitor events.'],
+        ['key'=>'caravan','name'=>'Caravan Camp','icon'=>'assets/map/caravan_empty.png','unlock'=>'location_caravan','hint'=>'Unlocked by relic-driven visitor events.'],
         ['key'=>'bone_brine','name'=>'Bone & Brine','icon'=>'☠️','unlock'=>'location_bone_brine','hint'=>'Permanent oddities stall after their relic event.'],
-        ['key'=>'helpers','name'=>'Forest Folk','icon'=>'🧚','unlock'=>'helpers_unlocked','hint'=>'Summoned helpers using bells and equipped amulets.'],
+        ['key'=>'helpers','name'=>'Forest Folk','icon'=>'assets/map/fairy_folk.png','unlock'=>'helpers_unlocked','hint'=>'Summoned helpers using bells and equipped amulets.'],
     ];
+
+    $marketStatus = getMarketStatus($db, $userId);
 
     foreach ($defs as &$def) {
         $def['unlocked'] = !empty($unlocks[$def['unlock']]);
-        if ($def['key'] === 'market' && $progress['reputation'] >= 10) {
-            $def['can_unlock'] = true;
-            $def['hint'] = 'The shopkeeper is ready to invite you to the weekend market.';
+        $def['disabled'] = false;
+        if ($def['key'] === 'market') {
+            $def['is_open'] = (bool)$marketStatus['is_open'];
+            $def['market_status'] = $marketStatus;
+            if ($def['unlocked'] && !$marketStatus['is_open']) {
+                $def['disabled'] = true;
+                $def['hint'] = 'The Fae Market is not open right now.';
+            } elseif ($def['unlocked']) {
+                $def['hint'] = 'The Fae Market is open. They buy any crop, with no daily limit.';
+            } elseif ($progress['reputation'] >= 10) {
+                // Reputation creates a shop event marker; accepting that event grants location_market.
+                $def['can_unlock'] = false;
+                $def['hint'] = 'The shopkeeper may have something to say at the General Store.';
+            }
         }
     }
+    unset($def);
     return $defs;
 }
 
 function maybeGrantMarketInvite(mysqli $db, int $userId): void
 {
+    // v0.4.16d: reputation no longer silently unlocks the Farmer's Market.
+    // It now creates a location-driven event marker handled by getLocationEvents().
+}
+
+function getLocationEvents(mysqli $db, int $userId): array
+{
+    $events = [];
     $progress = getPlayerProgress($db, $userId);
-    if ($progress['reputation'] >= 10 && !hasUnlock($db, $userId, 'location_market')) {
-        grantUnlock($db, $userId, 'location_market', 'reputation_10');
+
+    if ($progress['reputation'] >= 10
+        && !hasUnlock($db, $userId, 'location_market')
+        && eventHasFirstStep($db, 'market_shopkeeper_invite')) {
+        $events[] = [
+            'event_key' => 'market_shopkeeper_invite',
+            'location_key' => 'shop',
+            'title' => 'Fae Market Invitation',
+            'tooltip' => 'The shopkeepers have something to tell you.',
+            'icon' => systemIconByCode($db, 'quest_available', '!')
+        ];
     }
+
+    return $events;
+}
+
+function canStartLocationEvent(mysqli $db, int $userId, string $eventKey, string $locationKey): bool
+{
+    foreach (getLocationEvents($db, $userId) as $event) {
+        if ($event['event_key'] === $eventKey && $event['location_key'] === $locationKey) return true;
+    }
+    return false;
+}
+
+function systemIconByCode(mysqli $db, string $code, string $fallback): string
+{
+    $stmt = $db->prepare("SELECT icon FROM items WHERE code = ? AND item_type = 'system' AND is_active = 1 LIMIT 1");
+    if (!$stmt) return $fallback;
+    $stmt->bind_param('s', $code);
+    if (!@$stmt->execute()) return $fallback;
+    $row = $stmt->get_result()->fetch_assoc();
+    return $row['icon'] ?? $fallback;
 }
 
 function scheduleMadamRuneVisit(mysqli $db, int $userId): void
@@ -692,20 +1004,34 @@ function randomRelicName(): string
 function getShopRefresh(mysqli $db, int $userId): array
 {
     $config = getGameConfig($db);
-    $minutes = max(5, (int)($config['shop_refresh_minutes'] ?? 60));
-    $stmt = $db->prepare("SELECT next_shop_refresh_at FROM player_state WHERE user_id=? LIMIT 1");
-    $stmt->bind_param('i', $userId); $stmt->execute();
+    $dayLength = max(60, (int)($config['day_length_seconds'] ?? 720));
+    $targetHour = 7;
+
+    $stmt = $db->prepare("SELECT started_at, next_shop_refresh_at FROM player_state WHERE user_id=? LIMIT 1");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
     $row = $stmt->get_result()->fetch_assoc();
-    $next = $row['next_shop_refresh_at'] ?? null;
-    if (!$next || strtotime($next) <= time()) {
-        $stmt = $db->prepare("UPDATE player_state SET next_shop_refresh_at = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE user_id=?");
-        $stmt->bind_param('ii', $minutes, $userId); $stmt->execute();
-        $next = date('Y-m-d H:i:s', time() + $minutes * 60);
+    $startedAt = $row ? strtotime($row['started_at']) : time();
+    $elapsed = max(0, time() - $startedAt);
+    $dayIndex = (int)floor($elapsed / $dayLength);
+    $targetOffset = (int)round(($targetHour / 24) * $dayLength);
+    $candidate = $startedAt + ($dayIndex * $dayLength) + $targetOffset;
+    if ($candidate <= time()) {
+        $candidate += $dayLength;
     }
+
+    $next = date('Y-m-d H:i:s', $candidate);
+    if (($row['next_shop_refresh_at'] ?? null) !== $next) {
+        $stmt = $db->prepare("UPDATE player_state SET next_shop_refresh_at = ? WHERE user_id=?");
+        $stmt->bind_param('si', $next, $userId);
+        $stmt->execute();
+    }
+
     return [
         'next_refresh_at' => $next,
-        'seconds_remaining' => max(0, strtotime($next) - time()),
-        'refresh_minutes' => $minutes
+        'seconds_remaining' => max(0, $candidate - time()),
+        'refresh_minutes' => (int)round($dayLength / 60),
+        'refresh_game_hour' => $targetHour
     ];
 }
 
@@ -844,8 +1170,16 @@ function applyEventEffects(mysqli $db, int $userId, ?string $effectsJson): array
         }
         if ($type) {
             $helperTypeId = (int)$type['helper_type_id'];
-            $stmt = $db->prepare("INSERT INTO player_helpers (user_id, helper_type_id, helper_name, equipped_helper_equipment_id, active_task) VALUES (?, ?, ?, ?, ?)");
-            $stmt->bind_param('iisis', $userId, $helperTypeId, $name, $equipmentId, $task);
+            $xRatio = random_int(1800, 8200) / 10000;
+            $yRatio = random_int(1800, 8200) / 10000;
+            if ($equipmentId === null) {
+                $task = 'idle';
+                $stmt = $db->prepare("INSERT INTO player_helpers (user_id, helper_type_id, helper_name, equipped_helper_equipment_id, active_task, x_ratio, y_ratio) VALUES (?, ?, ?, NULL, ?, ?, ?)");
+                $stmt->bind_param('iissdd', $userId, $helperTypeId, $name, $task, $xRatio, $yRatio);
+            } else {
+                $stmt = $db->prepare("INSERT INTO player_helpers (user_id, helper_type_id, helper_name, equipped_helper_equipment_id, active_task, x_ratio, y_ratio) VALUES (?, ?, ?, ?, ?, ?, ?)");
+                $stmt->bind_param('iisisdd', $userId, $helperTypeId, $name, $equipmentId, $task, $xRatio, $yRatio);
+            }
             $stmt->execute();
             $result['helper'] = ['name'=>$name, 'type'=>$typeCode, 'task'=>$task];
         }

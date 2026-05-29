@@ -3,10 +3,16 @@ require_once __DIR__ . '/../includes/bootstrap.php';
 
 $userId = requireLogin();
 ensurePlayerDefaults($db, $userId);
-processGrowth($db, $userId);
 
 $input = json_decode(file_get_contents('php://input'), true) ?: [];
 $action = $input['action'] ?? '';
+$trustedGardenActions = ['till', 'water', 'plant', 'harvest', 'dig'];
+$isTrustedGardenAction = !empty($input['trusted_client']) && in_array($action, $trustedGardenActions, true);
+
+if (!$isTrustedGardenAction) {
+    processGrowth($db, $userId);
+    processHelperAutomation($db, $userId);
+}
 
 function getPlayerTool(mysqli $db, int $userId, string $toolType): array
 {
@@ -35,11 +41,77 @@ function toolMessage(array $tool, string $fallback): string
     return $tool['action_message'] ?: $fallback;
 }
 
+function shedTablesReady(mysqli $db): bool
+{
+    $res = $db->query("SELECT COUNT(*) AS c FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'player_shed_objects'");
+    return $res && (int)($res->fetch_assoc()['c'] ?? 0) > 0;
+}
+
+function ensureMachineShedObject(mysqli $db, int $userId, int $playerMachineId, array $machine): void
+{
+    if (!shedTablesReady($db)) return;
+
+    $machineType = (string)($machine['machine_type'] ?? 'machine');
+    $placeableKey = $machineType === 'preserve' ? 'preserve_bin' : $machineType;
+
+    $stmt = $db->prepare("SELECT placeable_id FROM placeable_defs WHERE placeable_key = ? AND is_active = 1 LIMIT 1");
+    $stmt->bind_param('s', $placeableKey);
+    $stmt->execute();
+    $def = $stmt->get_result()->fetch_assoc();
+    if (!$def) return;
+
+    $placeableId = (int)$def['placeable_id'];
+    $stmt = $db->prepare("SELECT shed_object_id FROM player_shed_objects WHERE user_id = ? AND player_machine_id = ? AND is_active = 1 LIMIT 1");
+    $stmt->bind_param('ii', $userId, $playerMachineId);
+    $stmt->execute();
+    if ($stmt->get_result()->fetch_assoc()) return;
+
+    $stmt = $db->prepare("INSERT INTO player_shed_objects (user_id, placeable_id, object_category, player_machine_id, zone_key, grid_x, grid_y, rotation, z_index, is_active) VALUES (?, ?, 'machine', ?, 'floor', 1, 1, 0, 10, 1)");
+    $stmt->bind_param('iii', $userId, $placeableId, $playerMachineId);
+    $stmt->execute();
+}
+
+function shedPlacementOverlap(mysqli $db, int $userId, int $objectId, string $zoneKey, int $gridX, int $gridY, int $gridW, int $gridH): bool
+{
+    $stmt = $db->prepare("\n        SELECT pso.shed_object_id, pso.grid_x, pso.grid_y, pd.grid_w, pd.grid_h, pso.rotation\n        FROM player_shed_objects pso\n        JOIN placeable_defs pd ON pd.placeable_id = pso.placeable_id\n        WHERE pso.user_id = ?\n          AND pso.zone_key = ?\n          AND pso.is_active = 1\n          AND pso.shed_object_id <> ?\n    ");
+    $stmt->bind_param('isi', $userId, $zoneKey, $objectId);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    while ($row = $res->fetch_assoc()) {
+        $ow = (int)$row['grid_w'];
+        $oh = (int)$row['grid_h'];
+        $rot = (int)$row['rotation'];
+        if ($rot === 90 || $rot === 270) { $tmp = $ow; $ow = $oh; $oh = $tmp; }
+        $ox = (int)$row['grid_x'];
+        $oy = (int)$row['grid_y'];
+        if ($gridX < $ox + $ow && $gridX + $gridW > $ox && $gridY < $oy + $oh && $gridY + $gridH > $oy) {
+            return true;
+        }
+    }
+    return false;
+}
+
 try {
     $db->begin_transaction();
 
     if ($action === 'till') {
         $plotId = (int) ($input['plot_id'] ?? 0);
+
+        if ($isTrustedGardenAction) {
+            $progress = max(0, min(100, (int)($input['till_progress'] ?? 0)));
+            $isTilled = !empty($input['is_tilled']) || $progress >= 100 ? 1 : 0;
+            $stmt = $db->prepare("
+                UPDATE garden_plots gp
+                JOIN gardens g ON g.garden_id = gp.garden_id
+                SET gp.till_progress = ?, gp.is_tilled = ?
+                WHERE gp.plot_id = ? AND g.user_id = ? AND gp.is_unlocked = 1
+            ");
+            $stmt->bind_param('iiii', $progress, $isTilled, $plotId, $userId);
+            $stmt->execute();
+            $db->commit();
+            jsonResponse(['ok' => true, 'message' => 'Tilled.']);
+        }
+
         $tool = getPlayerTool($db, $userId, 'hoe');
         $strength = (int) $tool['strength'];
 
@@ -65,6 +137,37 @@ try {
 
     if ($action === 'water') {
         $cropId = (int) ($input['planted_crop_id'] ?? 0);
+
+        if ($isTrustedGardenAction) {
+            $water = max(0, (int)($input['water_current'] ?? 0));
+            if ($cropId > 0) {
+                $stmt = $db->prepare("
+                    UPDATE planted_crops pc
+                    JOIN plants p ON p.plant_id = pc.plant_id
+                    SET pc.water_current = LEAST(p.water_max, ?)
+                    WHERE pc.planted_crop_id = ? AND pc.user_id = ? AND pc.is_harvested = 0
+                ");
+                $stmt->bind_param('iii', $water, $cropId, $userId);
+                $stmt->execute();
+            } else {
+                $gardenId = (int)($input['garden_id'] ?? 0);
+                $originX = (int)($input['origin_x'] ?? 0);
+                $originY = (int)($input['origin_y'] ?? 0);
+                $stmt = $db->prepare("
+                    UPDATE planted_crops pc
+                    JOIN plants p ON p.plant_id = pc.plant_id
+                    SET pc.water_current = LEAST(p.water_max, ?)
+                    WHERE pc.user_id = ? AND pc.garden_id = ?
+                      AND pc.origin_x = ? AND pc.origin_y = ?
+                      AND pc.is_harvested = 0
+                ");
+                $stmt->bind_param('iiiii', $water, $userId, $gardenId, $originX, $originY);
+                $stmt->execute();
+            }
+            $db->commit();
+            jsonResponse(['ok' => true, 'message' => 'Watered.']);
+        }
+
         $tool = getPlayerTool($db, $userId, 'watering_can');
         $strength = (int) $tool['strength'];
 
@@ -149,15 +252,19 @@ try {
             throw new RuntimeException('You need seeds for that crop.');
         }
 
+        $clock = getGameClock($db, $userId);
+        $plantCycleIndex = cycleIndexForElapsedHours((float)$clock['total_game_hours_elapsed'], (int)$plant['cycle_hour']);
+
         $stmt = $db->prepare("
-            INSERT INTO planted_crops (user_id, garden_id, plant_id, origin_x, origin_y, water_current)
-            VALUES (?, ?, ?, ?, ?, 0)
+            INSERT INTO planted_crops (user_id, garden_id, plant_id, origin_x, origin_y, water_current, last_cycle_index)
+            VALUES (?, ?, ?, ?, ?, 0, ?)
         ");
-        $stmt->bind_param('iiiii', $userId, $gardenId, $plantId, $x, $y);
+        $stmt->bind_param('iiiiii', $userId, $gardenId, $plantId, $x, $y, $plantCycleIndex);
         $stmt->execute();
+        $plantedCropId = (int)$db->insert_id;
 
         $db->commit();
-        jsonResponse(['ok' => true, 'message' => $plant['name'] . ' planted.']);
+        jsonResponse(['ok' => true, 'message' => $plant['name'] . ' planted.', 'planted_crop_id' => $plantedCropId]);
     }
 
     if ($action === 'harvest') {
@@ -259,14 +366,40 @@ try {
     if ($action === 'sell_item') {
         $itemId = (int) ($input['item_id'] ?? 0);
         $qty = max(1, (int) ($input['quantity'] ?? 1));
+        $saleContext = trim((string)($input['sale_context'] ?? 'shop'));
+        if (!in_array($saleContext, ['shop', 'market'], true)) $saleContext = 'shop';
 
-        $stmt = $db->prepare("SELECT base_sell_price, name FROM items WHERE item_id = ? LIMIT 1");
+        $stmt = $db->prepare("SELECT item_id, code, name, item_type, base_sell_price FROM items WHERE item_id = ? LIMIT 1");
         $stmt->bind_param('i', $itemId);
         $stmt->execute();
         $item = $stmt->get_result()->fetch_assoc();
 
         if (!$item || (int) $item['base_sell_price'] <= 0) {
             throw new RuntimeException('That cannot be sold.');
+        }
+
+        if ($saleContext === 'market') {
+            $marketStatus = getMarketStatus($db, $userId);
+            if (empty($marketStatus['is_open'])) throw new RuntimeException('The Fae Market is not open right now.');
+            if (($item['item_type'] ?? '') !== 'produce') throw new RuntimeException('The market is only buying crops right now.');
+        } else {
+            if (!tableExists($db, 'shop_buy_limits')) throw new RuntimeException('The shop is not buying produce right now.');
+            $clock = getGameClock($db, $userId);
+            $shopDay = (int)($clock['absolute_day'] ?? 1);
+            $stmt = $db->prepare("
+                SELECT sbl.daily_limit, COALESCE(sold.quantity_sold, 0) AS quantity_sold
+                FROM shop_buy_limits sbl
+                LEFT JOIN player_shop_sales sold
+                  ON sold.user_id = ? AND sold.item_id = sbl.item_id AND sold.shop_day = ?
+                WHERE sbl.item_id = ? AND sbl.is_active = 1
+                LIMIT 1
+            ");
+            $stmt->bind_param('iii', $userId, $shopDay, $itemId);
+            $stmt->execute();
+            $limit = $stmt->get_result()->fetch_assoc();
+            if (!$limit) throw new RuntimeException('The shop is not buying that item today.');
+            $remaining = max(0, (int)$limit['daily_limit'] - (int)$limit['quantity_sold']);
+            if ($qty > $remaining) throw new RuntimeException('The shop has already bought enough of that item today.');
         }
 
         if (!removeInventory($db, $userId, $itemId, $qty)) {
@@ -278,6 +411,18 @@ try {
         $stmt = $db->prepare("UPDATE users SET coins = coins + ? WHERE user_id = ?");
         $stmt->bind_param('ii', $coins, $userId);
         $stmt->execute();
+
+        if ($saleContext === 'shop' && tableExists($db, 'player_shop_sales')) {
+            $clock = getGameClock($db, $userId);
+            $shopDay = (int)($clock['absolute_day'] ?? 1);
+            $stmt = $db->prepare("
+                INSERT INTO player_shop_sales (user_id, item_id, shop_day, quantity_sold)
+                VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE quantity_sold = quantity_sold + VALUES(quantity_sold)
+            ");
+            $stmt->bind_param('iiii', $userId, $itemId, $shopDay, $qty);
+            $stmt->execute();
+        }
 
         $db->commit();
         jsonResponse(['ok' => true, 'message' => '+' . $coins . ' coins.']);
@@ -377,6 +522,24 @@ try {
         jsonResponse($result);
     }
 
+
+    if ($action === 'start_location_event') {
+        $eventKey = trim((string)($input['event_key'] ?? ''));
+        $locationKey = trim((string)($input['location_key'] ?? ''));
+        if ($eventKey === '' || $locationKey === '') {
+            throw new RuntimeException('Missing location event.');
+        }
+        if (!canStartLocationEvent($db, $userId, $eventKey, $locationKey)) {
+            throw new RuntimeException('That event is not available right now.');
+        }
+        $storyEvent = startPlayerEvent($db, $userId, $eventKey);
+        if (!$storyEvent) {
+            throw new RuntimeException('Could not start that event.');
+        }
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'Event started.', 'story_event' => $storyEvent]);
+    }
+
     if ($action === 'start_fairy_bell_event') {
         if (!hasUnlock($db, $userId, 'madam_rune_intro_seen')) {
             throw new RuntimeException('The bell has not found its way to you yet.');
@@ -418,6 +581,96 @@ try {
         }
     }
 
+
+    if ($action === 'unlock_plot') {
+        $plotId = (int)($input['plot_id'] ?? 0);
+        $item = $db->query("SELECT item_id, name FROM items WHERE code = 'land_claim_note' LIMIT 1")->fetch_assoc();
+        if (!$item) throw new RuntimeException('Missing Land Claim Note item.');
+        $itemId = (int)$item['item_id'];
+
+        $stmt = $db->prepare("
+            SELECT gp.*
+            FROM garden_plots gp
+            JOIN gardens g ON g.garden_id = gp.garden_id
+            WHERE gp.plot_id = ? AND g.user_id = ?
+            LIMIT 1
+        ");
+        $stmt->bind_param('ii', $plotId, $userId);
+        $stmt->execute();
+        $plot = $stmt->get_result()->fetch_assoc();
+        if (!$plot) throw new RuntimeException('Plot not found.');
+        if ((int)$plot['is_unlocked']) throw new RuntimeException('That plot is already unlocked.');
+        if (!removeInventory($db, $userId, $itemId, 1)) throw new RuntimeException('You need a Land Claim Note to unlock that plot.');
+
+        $stmt = $db->prepare("UPDATE garden_plots SET is_unlocked = 1, unlocked_at = NOW() WHERE plot_id = ?");
+        $stmt->bind_param('i', $plotId);
+        $stmt->execute();
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'Plot unlocked.']);
+    }
+
+    if ($action === 'equip_helper_accessory') {
+        $helperId = (int)($input['player_helper_id'] ?? 0);
+        $equipmentId = isset($input['helper_equipment_id']) && $input['helper_equipment_id'] !== null ? (int)$input['helper_equipment_id'] : 0;
+        $stmt = $db->prepare("SELECT player_helper_id FROM player_helpers WHERE player_helper_id = ? AND user_id = ? LIMIT 1");
+        $stmt->bind_param('ii', $helperId, $userId);
+        $stmt->execute();
+        if (!$stmt->get_result()->fetch_assoc()) throw new RuntimeException('Helper not found.');
+
+        if ($equipmentId <= 0) {
+            $stmt = $db->prepare("UPDATE player_helpers SET equipped_helper_equipment_id = NULL, active_task = 'idle' WHERE player_helper_id = ? AND user_id = ?");
+            $stmt->bind_param('ii', $helperId, $userId);
+            $stmt->execute();
+            $db->commit();
+            jsonResponse(['ok' => true, 'message' => 'Accessory removed.']);
+        }
+
+        $stmt = $db->prepare("SELECT he.*, i.item_id, COALESCE(inv.quantity,0) AS owned_quantity FROM helper_equipment he LEFT JOIN items i ON i.code = he.code AND i.item_type = 'helper_equipment' LEFT JOIN player_inventory inv ON inv.item_id = i.item_id AND inv.user_id = ? WHERE he.helper_equipment_id = ? AND he.is_active = 1 LIMIT 1");
+        $stmt->bind_param('ii', $userId, $equipmentId);
+        $stmt->execute();
+        $equip = $stmt->get_result()->fetch_assoc();
+        if (!$equip) throw new RuntimeException('Accessory not found.');
+        if ((int)($equip['owned_quantity'] ?? 0) < 1) throw new RuntimeException('You do not own that accessory.');
+
+        $stmt = $db->prepare("UPDATE player_helpers SET equipped_helper_equipment_id = ?, active_task = ? WHERE player_helper_id = ? AND user_id = ?");
+        $task = (string)$equip['task_type'];
+        $stmt->bind_param('isii', $equipmentId, $task, $helperId, $userId);
+        $stmt->execute();
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => $equip['name'] . ' equipped.']);
+    }
+
+    if ($action === 'buy_special_item') {
+        $code = trim((string)($input['code'] ?? ''));
+        if ($code !== 'land_claim_note') throw new RuntimeException('Special item not available.');
+        $stmt = $db->prepare("SELECT * FROM items WHERE code = ? AND is_active = 1 LIMIT 1");
+        $stmt->bind_param('s', $code);
+        $stmt->execute();
+        $item = $stmt->get_result()->fetch_assoc();
+        if (!$item) throw new RuntimeException('Special item not found.');
+
+        $landItemId = (int)$item['item_id'];
+        $stmt = $db->prepare("SELECT COUNT(*) AS purchase_count FROM player_unlocks WHERE user_id = ? AND unlock_key LIKE 'shop_land_claim_note_%'");
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $purchaseCount = (int)($stmt->get_result()->fetch_assoc()['purchase_count'] ?? 0);
+        if ($purchaseCount >= 3) throw new RuntimeException('The shop is out of Land Claim Notes for you.');
+
+        $cost = (int)$item['base_buy_price'] + ($purchaseCount * 75);
+        $stmt = $db->prepare("SELECT coins FROM users WHERE user_id = ? LIMIT 1");
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $user = $stmt->get_result()->fetch_assoc();
+        if (!$user || (int)$user['coins'] < $cost) throw new RuntimeException('Not enough coins.');
+        $stmt = $db->prepare("UPDATE users SET coins = coins - ? WHERE user_id = ?");
+        $stmt->bind_param('ii', $cost, $userId);
+        $stmt->execute();
+        addInventory($db, $userId, $landItemId, 1);
+        grantUnlock($db, $userId, 'shop_land_claim_note_' . ($purchaseCount + 1), 'shop_purchase');
+        $db->commit();
+        jsonResponse(['ok'=>true, 'message'=>$item['name'].' bought.']);
+    }
+
     if ($action === 'buy_machine') {
         $machineId = (int) ($input['machine_id'] ?? 0);
 
@@ -428,6 +681,9 @@ try {
 
         if (!$machine) {
             throw new RuntimeException('Machine not found.');
+        }
+        if (($machine['machine_type'] ?? '') !== 'preserve') {
+            throw new RuntimeException('That machine is not sold in the General Store yet.');
         }
 
         $cost = (int) $machine['base_cost'];
@@ -453,8 +709,65 @@ try {
         $stmt->bind_param('ii', $userId, $machineId);
         $stmt->execute();
 
+        $stmt = $db->prepare("SELECT player_machine_id FROM player_machines WHERE user_id = ? AND machine_id = ? LIMIT 1");
+        $stmt->bind_param('ii', $userId, $machineId);
+        $stmt->execute();
+        $ownedMachine = $stmt->get_result()->fetch_assoc();
+        if ($ownedMachine) {
+            grantUnlock($db, $userId, 'location_shed', 'machine_purchase');
+        }
+
         $db->commit();
         jsonResponse(['ok' => true, 'message' => $machine['name'] . ' bought.']);
+    }
+
+
+    if ($action === 'move_shed_object') {
+        if (!shedTablesReady($db)) {
+            throw new RuntimeException('Shed placement tables are missing.');
+        }
+
+        $objectId = (int)($input['shed_object_id'] ?? 0);
+        $gridX = max(0, (int)($input['grid_x'] ?? 0));
+        $gridY = max(0, (int)($input['grid_y'] ?? 0));
+        $rotation = (int)($input['rotation'] ?? 0);
+        if (!in_array($rotation, [0, 90, 180, 270], true)) $rotation = 0;
+
+        $stmt = $db->prepare("\n            SELECT pso.*, pd.grid_w, pd.grid_h\n            FROM player_shed_objects pso\n            JOIN placeable_defs pd ON pd.placeable_id = pso.placeable_id\n            WHERE pso.shed_object_id = ? AND pso.user_id = ? AND pso.is_active = 1\n            LIMIT 1\n        ");
+        $stmt->bind_param('ii', $objectId, $userId);
+        $stmt->execute();
+        $object = $stmt->get_result()->fetch_assoc();
+        if (!$object) {
+            throw new RuntimeException('Shed object not found.');
+        }
+
+        $zoneKey = (string)$object['zone_key'];
+        $gridW = (int)$object['grid_w'];
+        $gridH = (int)$object['grid_h'];
+        if ($rotation === 90 || $rotation === 270) { $tmp = $gridW; $gridW = $gridH; $gridH = $tmp; }
+
+        $stmt = $db->prepare("SELECT * FROM shed_zones WHERE zone_key = ? AND is_active = 1 LIMIT 1");
+        $stmt->bind_param('s', $zoneKey);
+        $stmt->execute();
+        $zone = $stmt->get_result()->fetch_assoc();
+        if (!$zone) {
+            throw new RuntimeException('Shed zone not found.');
+        }
+
+        if ($gridX + $gridW > (int)$zone['grid_cols'] || $gridY + $gridH > (int)$zone['grid_rows']) {
+            throw new RuntimeException('That will not fit there.');
+        }
+
+        if (shedPlacementOverlap($db, $userId, $objectId, $zoneKey, $gridX, $gridY, $gridW, $gridH)) {
+            throw new RuntimeException('Something is already there.');
+        }
+
+        $stmt = $db->prepare("UPDATE player_shed_objects SET grid_x = ?, grid_y = ?, rotation = ? WHERE shed_object_id = ? AND user_id = ?");
+        $stmt->bind_param('iiiii', $gridX, $gridY, $rotation, $objectId, $userId);
+        $stmt->execute();
+
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'Shed layout saved.']);
     }
 
     if ($action === 'start_processing') {
@@ -471,10 +784,13 @@ try {
         }
 
         $stmt = $db->prepare("
-            SELECT pm.player_machine_id
+            SELECT pm.player_machine_id, pm.quantity,
+                   COUNT(j.job_id) AS active_jobs
             FROM player_machines pm
             JOIN machines m ON m.machine_id = pm.machine_id
+            LEFT JOIN processing_jobs j ON j.player_machine_id = pm.player_machine_id AND j.is_collected = 0
             WHERE pm.user_id = ? AND m.machine_type = ?
+            GROUP BY pm.player_machine_id, pm.quantity
             LIMIT 1
         ");
         $stmt->bind_param('is', $userId, $recipe['machine_type']);
@@ -483,6 +799,9 @@ try {
 
         if (!$machine) {
             throw new RuntimeException('You need the right equipment.');
+        }
+        if ((int)($machine['active_jobs'] ?? 0) >= (int)($machine['quantity'] ?? 1)) {
+            throw new RuntimeException('All of those machines are already busy.');
         }
 
         $needed = (int) $recipe['input_quantity'] * $quantity;

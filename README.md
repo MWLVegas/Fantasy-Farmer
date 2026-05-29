@@ -390,3 +390,218 @@ Notes:
 - Added map background scaffolding through `game_config.map_background_image`.
 - Added map button coordinate scaffolding through `game_config.map_button_positions_json` so future illustrated maps can place location buttons by pixel position.
 - Bumped database-backed app version to v0.4.9.
+
+## v0.4.11
+
+- Added readable per-location map marker config rows in `map_location_config`.
+- Map markers now support pixel `map_x` / `map_y` coordinates and per-location PNG marker icons.
+- Current marker paths use `/assets/map/`: `caravan_empty`, `fairy_folk`, `garden`, `orders`, and `store`, with placeholders for future shed/market/Bone & Brine art.
+- Unlocked map locations now render as clickable image markers with a subtle pulsing glow and hover-grow effect.
+- Locked map locations render their configured image as a black silhouette and show `???` until unlocked.
+- Updated day-orb icon sizing to `2rem`, allowed day-track overflow, and added image/text shadows so sun/moon icons remain legible on the track.
+- Bumped database-backed app version to v0.4.11.
+
+## v0.4.11
+
+- Removed boxed map-location cards so markers sit directly on the map artwork.
+- Map location icons now smoothly grow on hover.
+- Unlocked map markers get a subtle dark pulsing glow to indicate they are clickable.
+- Locked map markers use the configured location icon as a black silhouette and show `???`.
+- Map labels now render as small readable pills below the image instead of large cards.
+- Removed dead `.map-location-card` CSS from the old boxed-map approach.
+- Bumped database-backed app version to v0.4.11.
+
+
+## v0.4.11a
+
+- Added `game_config.map_title` for the map title.
+- Changed the default map title from `Overhead Map` to `Town`.
+- Canvas and side-panel map title now read from database-backed state.
+- Bumped app version to `v0.4.11a`.
+
+
+## v0.4.12a
+
+- Added the first pass of the Workroom / Shed placement system.
+- Buying a Preserves Bin now unlocks the Shed location and backfills existing owners.
+- Added `shed_zones` for separate wall and floor placement grids.
+- Added `placeable_defs` for placeable object size, zone, category, icon, and future rotation support.
+- Added `player_shed_objects` for per-player shed layouts.
+- The Shed canvas now renders wall/floor grid overlays in edit mode.
+- The Preserves Bin appears as a 2×2 floor machine and can be dragged to valid grid cells.
+- Shed placement prevents overlapping objects and saves movement through `move_shed_object`.
+- Version pill now stays fixed to the page-load version and warns if the server version changes during polling.
+- Bumped database-backed app version to `v0.4.12a`.
+
+## v0.4.12a
+
+- Pivoted Shed functional machines from draggable floor objects to fixed clickable stations.
+- Added station scaffolding for Preserves Bin, Drying Rack, Compost Bin, Seed Bin, and Workbench.
+- Buying machines still unlocks the Shed; owned machine quantity now powers the station modal capacity.
+- Preserves Bin station opens a machine modal showing owned slots, active jobs, ready jobs, and available recipes.
+- Added slot enforcement so one owned machine unit can only run one active/uncollected processing job.
+- Kept wall-decoration placement scaffolding separate from functional floor stations.
+- Added `shed_station_config` table.
+- Added map marker `icon_size` and `glow_color` controls.
+- Changed map marker glow default to a warmer yellow click cue.
+- Added `database/schema_v0_4_12a.sql`.
+
+## v0.4.12b
+
+### Added
+- Added Forest Folk helper scaffolding with named helpers, race display, accessory slots, helper movement positions, speed/effectiveness stats, and future potion boost columns.
+- Added Forest Folk accessory equipment records for Water, Till, Plant, Harvest, future Farmer's Market auto-sell, and future order automation.
+- Added client-side Forest Folk equipment controls so accessories can be equipped/unassigned from the Forest Folk screen.
+- Added a Land Claim Note item and locked-plot unlock flow.
+- Added a crop/plot Info tool to inspect crop name, quantity, full grow time, approximate remaining cycles, boosts, water, and projected yield range.
+- Added save-status indicator scaffolding for instant-feeling garden actions.
+- Added audio manager scaffolding for SFX/BGM that unlocks after first user interaction.
+- Added fairy-world calendar formatting: `Year X, Day Y` using a 300-day year.
+
+### Changed
+- General Store machines are now limited to the Preserves Bin; other machines are inactive for the store and reserved for later special/market/event sources.
+- Preserves Bin price increased for early pacing.
+- Order refill now schedules every 1 minute while available orders are below the board cap.
+- Order reward text now says price modifiers are included instead of showing ambiguous extra fee text.
+- First fairy summon no longer auto-equips the Aqua Amulet; Puddlewink arrives as a named Fairy with an empty accessory slot.
+
+### Database
+- Added `database/schema_v0_4_12b.sql`.
+- Bumped database-backed app version to `v0.4.12b`.
+
+## v0.4.12c
+
+- Expanded Puddlewink's Fairy Bell introduction into two steps and moved the helper unlock to the end of the scene.
+- Added real Forest Folk helper automation processing for Water, Till, Plant, and Harvest tasks.
+- Added `player_helpers.last_action_at` so helpers act on a paced cooldown instead of constantly firing.
+- Helper actions are intentionally weaker/slower than manual play: watering and tilling are small increments, and automated harvesting uses the low end of the crop yield.
+- Forest Folk accessories now only appear in the equip dropdown if the player owns them or already has them equipped.
+- Removed the old active Harvest Charm path in favor of the single Harvest Basket accessory.
+- Removed player-facing “future feature” copy from the Forest Folk screen and accessory descriptions.
+- Fixed the Inspect tool cursor so it shows the magnifier while using the garden info tool.
+- Disabled Complete on orders when the player does not have the required items, and moved the coin float to only appear after a successful server response.
+- Reworked canvas sizing for high-DPI displays so order board text is rendered against a DPR-scaled backing store instead of being browser-blown into soup.
+- Added `database/schema_v0_4_12c.sql`.
+- Bumped database-backed app version to `v0.4.12c`.
+
+## v0.4.13
+
+### Added
+- Added database-driven system icon records for coins, reputation, and recognition using the existing `/assets/icons/global-*.png` graphics.
+- Added a Ctrl-hover map coordinate helper. While hovering over the map canvas, holding Control shows the current canvas pixel `x, y` for updating map locations in the database.
+
+### Changed
+- Replaced hardcoded money, reputation, and recognition emoji usage in the main UI and order modal with icons loaded from `state.system_icons`.
+- Kept emoji fallbacks for canvas-only text and early-load states so the UI does not break if icons are missing.
+- Removed the remaining player-facing Forest Folk “Future Task Plan” heading from the side panel.
+
+### Database
+- Added `database/schema_v0_4_13.sql`.
+- Bumped database-backed app version to `v0.4.13`.
+
+
+## v0.4.14
+
+- Converted the Orders Board display from canvas text to a DOM-rendered board surface for sharper, crisper text.
+- Available order requirements now turn green when the player already owns enough of the requested item.
+- Accepted order cancellation now asks for confirmation and warns about the reputation loss.
+- Retuned Forest Folk watering automation so a water helper acts more often and bases water output on the player's current watering can while remaining weaker than manual watering.
+- Added `database/schema_v0_4_14.sql`.
+- Bumped database-backed app version to `v0.4.14`.
+
+
+## v0.4.15
+
+- Added the `#gardenCanvas[hidden] { display: none !important; }` CSS fix so DOM-rendered boards do not get pushed below the hidden canvas.
+- Garden actions now trust the client for the fast loop: tilling, watering, planting, harvesting, and digging update locally first and save in the background.
+- Background garden saves are queued sequentially so rapid actions stay responsive without stacking visible delays.
+- Watering now renders immediately after local water changes instead of waiting for the server refresh.
+- Added client-side watering helper automation so equipped water helpers periodically water crops while the garden is open.
+- Trusted watering/tilling writes can persist exact client-side values without re-running the full tool validation path.
+- Plant actions now return the real planted crop id so local optimistic crops can reconcile after background save.
+- Added `database/schema_v0_4_15.sql`.
+- Bumped database-backed app version to `v0.4.15`.
+
+
+## v0.4.16
+
+- Helper workers now move smoothly toward their target crop instead of snapping/teleporting when acting.
+- Water helpers now continue targeting the driest eligible crop and only water after reaching it.
+- Mature crops are excluded from watering automation.
+- Fully grown crops no longer display a water bar and inspect as not needing water.
+- Manual watering now refuses mature crops instead of wasting a water action.
+- Preserved the `#gardenCanvas[hidden]` CSS fix from the prior hotfix.
+- Added `database/schema_v0_4_16.sql`.
+- Bumped database-backed app version to `v0.4.16`.
+
+
+## v0.4.16a
+
+Hotfix release.
+
+- Fixed the garden canvas crash caused by missing `cropIsMature()`.
+- Added the missing shared `cropNeedsWater()` helper used by fairy watering automation.
+- Bumped the farm.js cache key to `v0.4.16a` so the browser stops requesting the old `v0.4.15` URL.
+- Added `database/schema_v0_4_16a.sql`.
+- Bumped database-backed app version to `v0.4.16a`.
+
+
+## v0.4.16c
+
+UI/UX hotfix release.
+
+- Orders Board DOM rendering now uses a structure key and only updates timer/reward text during the one-second clock tick instead of rebuilding the entire board every second.
+- Added small fade/slide screen transitions and modal pop-in animation so screen changes feel less abrupt.
+- Added card fade-in animation for order cards/details.
+- Watering helper float text now shows only the water gain text instead of reusing the fairy icon.
+- Idle Forest Folk now wander around the outer garden canvas instead of sitting perfectly still in the work area.
+- Seed pouch glow now uses image shadow/glow instead of drawing a circular glow behind the location.
+- Map location icons now fall back to `/assets/map/<location>.png`, including the garden icon, instead of showing a question mark when marker data is missing.
+- Moved money, reputation, and recognition out of the panel header and into the left side of the field actions row.
+- Forest Folk helper rows now render image icons instead of printing asset paths.
+- Cleaned Forest Folk helper copy to be more direct and less silly.
+- Moved Forest Folk accessory assignment onto the canvas with draggable owned accessories and helper equipment slots.
+- Added `database/schema_v0_4_16c.sql`.
+- Bumped database-backed app version to `v0.4.16c`.
+
+## v0.4.16d
+
+- Calmed the Orders Board updates: timers update in place, modal/card stable keys no longer include ticking seconds, and default order-card animations no longer replay on every refresh.
+- Confirming an available order now moves it locally first, then saves in the background; failed saves reconcile on the next state fetch.
+- Added coin tooltip, changed navigation labels to `Map` and `Backpack`, and made save status display as dots with tooltip text instead of words.
+- Added database-backed system icons for `nav_map`, `nav_backpack`, `nav_orders`, and `quest_available`.
+- Added location-driven event marker scaffolding with a configurable pulsing/shaking quest marker over map locations.
+- Changed the Farmer's Market unlock flow so reputation no longer silently unlocks it; the shop now shows a location event marker when the invite is available.
+- Added the database-driven `market_shopkeeper_invite` event, which unlocks the Farmer's Market when completed.
+- Added map sidebar timer content for shop refresh, future market open/close, and caravan scaffolding.
+- Added `side_menu_html` support on `map_location_config`, with order-board help text supplied from the database when present.
+- Added `database/schema_v0_4_16d.sql`.
+- Bumped app/cache keys to `v0.4.16d`.
+
+
+## v0.4.16e
+
+- Bumped the database-backed app version to `v0.4.16e`.
+- Fixed Farmer's Market visibility so reputation only creates the General Store invite event marker; the market itself stays locked until the event grants `location_market`.
+- Added a cleanup migration that removes accidental non-event Farmer's Market unlocks while preserving legitimate `event_effect` unlocks.
+
+
+## v0.4.16f
+
+- Added the missing `market_shopkeeper_invite` event data as a three-step Fae Market invitation.
+- Location event markers now fail closed: the shop quest marker only appears if the event exists, is active, and has a first step.
+- Changed the quest marker from red alert styling to a warmer golden glow.
+- Added weekend market gating. The Farmer's Market is visible after invitation, but cannot be entered while closed; tooltip explains it is closed.
+- Added server-side Fae Market status with weekend 7:00–18:00 hours and map sidebar timer support.
+- Added database scaffolding for shop daily buy limits with `shop_buy_limits` and `player_shop_sales`.
+- Shop sales now enforce daily limits and only buy configured basic crops; the Fae Market path is scaffolded to buy any crop while open.
+- Land Claim Notes now increase in shop price and stop after three total General Store purchases.
+- Added `database/schema_v0_4_16f.sql`.
+- Bumped app/cache/database version to `v0.4.16f`.
+
+
+## v0.4.16g
+
+- Fixed growth-cycle baseline for newly planted crops. Crops now store their current cycle index when planted, so planting carrots after 6am no longer causes them to immediately catch up through every previous 6am cycle.
+- Added `database/schema_v0_4_16g.sql` to bump the database version and initialize any still-unprocessed active crops with the correct planted-time cycle baseline.
+- Bumped app/cache/database version to `v0.4.16g`.
