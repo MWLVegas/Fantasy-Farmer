@@ -1,4 +1,4 @@
-console.info('Fantasy Farmer JS loaded: v0.4.16g');
+console.info('Fantasy Farmer JS loaded: v0.4.34');
 
 let state = null;
 let canvas = null;
@@ -18,7 +18,10 @@ let helperClientMotion = {};
 let localClockBase = null;
 let imageCache = {};
 let canvasSceneHits = [];
+let cropProblemHits = [];
 let canvasHoverHitId = null;
+let canvasHoverHitStartedAt = 0;
+let helperCanvasScroll = 0;
 let lastFx = [];
 let canvasFloatFx = [];
 let lastSeenOrderId = null;
@@ -29,6 +32,7 @@ let activeStoryKey = null;
 let mapMarkerScales = {};
 let loadedAppVersion = null;
 let versionMismatchShown = false;
+let latestServerVersion = null;
 let shedEditMode = false;
 let shedDrag = null;
 let savePendingCount = 0;
@@ -38,6 +42,20 @@ let currentBgmKey = null;
 let isCtrlDown = false;
 let lastRenderedOrderBoardKey = '';
 let helperAccessoryDrag = null;
+let marketSceneBackground = '';
+let marketSceneBackgroundPrev = '';
+let marketSceneTransitionStartedAt = 0;
+let calendarModalBound = false;
+let marketWanderers = [];
+let marketWandererSeed = '';
+let panelBackgroundImage = '';
+let panelBackgroundPrevImage = '';
+let panelBackgroundTransitionStartedAt = 0;
+const LOCATION_BACKGROUND_TRANSITION_MS = 1000;
+const STATE_BACKGROUND_TRANSITION_MS = 2100;
+let panelBackgroundScreen = '';
+let panelBackgroundTransitionMs = STATE_BACKGROUND_TRANSITION_MS;
+const imagePreloadPromises = {};
 const BGM_BY_SCREEN = { map: '', garden: '', shop: '', shed: '', orders: '', helpers: '' };
 const SFX_BY_ACTION = { till: '', water: '', plant: '', harvest: '', unlock_plot: '', equip_helper_accessory: '', buy_machine: '' };
 let canvasCssSize = 720;
@@ -75,15 +93,31 @@ function recognitionIcon() {
 }
 
 function mapIcon() {
-  return systemIcon('nav_map', '🗺️');
+  return systemIcon('nav_map', systemIcon('global_map', '🗺️'));
 }
 
 function backpackIcon() {
-  return systemIcon('nav_backpack', '🎒');
+  return systemIcon('nav_backpack', systemIcon('global_backpack', '🎒'));
 }
 
 function ordersIcon() {
-  return systemIcon('nav_orders', '📜');
+  return systemIcon('nav_orders', systemIcon('global_orders', '📜'));
+}
+
+function calendarIcon() {
+  return systemIcon('nav_calendar', systemIcon('global_calendar', '📅'));
+}
+
+function harvestToolIcon() {
+  return systemIcon('tool_harvest', systemIcon('harvest_basket', ''));
+}
+
+function inspectToolIcon() {
+  return systemIcon('tool_inspect', '');
+}
+
+function actionFxIcon(kind) {
+  return systemIcon(`fx_${kind}`, '');
 }
 
 function questIcon() {
@@ -123,6 +157,58 @@ function setTextIfExists(selector, value) {
 
 function isImageIcon(icon) {
   return typeof icon === 'string' && icon.includes('.');
+}
+
+function assetUrl(path) {
+  if (!path || !isImageIcon(path)) return path || '';
+  try { return new URL(path, document.baseURI).href; }
+  catch { return path; }
+}
+
+function cssImageUrl(path) {
+  const url = assetUrl(path);
+  return url ? `url("${String(url).replace(/\"/g, '%22')}")` : 'none';
+}
+
+function preloadImageAsset(src) {
+  if (!src || !isImageIcon(src)) return Promise.resolve(null);
+  const key = String(src);
+  const cached = imageCache[key];
+  if (cached?.complete && cached.naturalWidth) return Promise.resolve(cached);
+  if (imagePreloadPromises[key]) return imagePreloadPromises[key];
+
+  const img = cached || new Image();
+  imageCache[key] = img;
+
+  imagePreloadPromises[key] = new Promise(resolve => {
+    const finish = () => {
+      const done = () => { render(); resolve(img); };
+      if (img.decode) img.decode().catch(() => {}).finally(done);
+      else done();
+    };
+    const fail = () => {
+      img.failed = true;
+      resolve(null);
+    };
+
+    if (!img.src) img.src = assetUrl(key);
+
+    if (img.complete) {
+      finish();
+      return;
+    }
+
+    img.addEventListener('load', finish, { once: true });
+    img.addEventListener('error', fail, { once: true });
+  });
+
+  return imagePreloadPromises[key];
+}
+
+function preloadImageAssets(srcList = []) {
+  const unique = [...new Set((srcList || []).filter(src => src && isImageIcon(src)))];
+  if (!unique.length) return Promise.resolve([]);
+  return Promise.allSettled(unique.map(preloadImageAsset));
 }
 
 function iconHtml(icon, className = 'tooltip-inline-icon') {
@@ -166,13 +252,11 @@ function drawIcon(icon, x, y, size = 42) {
 
   let img = imageCache[icon];
   if (!img) {
-    img = new Image();
-    img.src = icon;
-    imageCache[icon] = img;
-    img.onload = () => {};
+    preloadImageAsset(icon);
+    img = imageCache[icon];
   }
 
-  if (!img.complete || !img.naturalWidth) {
+  if (!img || !img.complete || !img.naturalWidth || img.failed) {
     ctx.fillStyle = '#b8a88f';
     ctx.font = `${Math.floor(size * .45)}px system-ui`;
     ctx.textAlign = 'center';
@@ -236,13 +320,28 @@ function bindTooltip(el, html) {
   el.addEventListener('mouseleave', hideTooltip);
 }
 
-function showStatus(message, isError = false) {
+function showStatus(message, isError = false, options = {}) {
   const box = $('#statusMessage');
   if (!box) return;
   box.innerHTML = formatMessageIcons(message);
-  box.className = `status-message visible ${isError ? 'error' : ''}`;
+  box.className = `status-message visible ${isError ? 'error' : ''} ${options.persistent ? 'persistent' : ''}`;
   clearTimeout(showStatus._t);
-  showStatus._t = setTimeout(() => box.className = 'status-message', 1600);
+  if (!options.persistent) {
+    showStatus._t = setTimeout(() => {
+      box.className = 'status-message';
+      if (versionMismatchShown && latestServerVersion) showPersistentUpdateWarning(latestServerVersion);
+    }, Number(options.duration || 1600));
+  }
+}
+
+function showPersistentUpdateWarning(serverVersion) {
+  latestServerVersion = serverVersion;
+  showStatus(`New version available: ${serverVersion}. Reload to update.`, true, { persistent: true });
+  const vp = $('#versionPill');
+  if (vp) {
+    vp.classList.add('version-pill--outdated');
+    vp.dataset.tooltipHtml = `<b>Update available</b><br>Loaded ${escapeHtml(loadedAppVersion || 'unknown')} · Database ${escapeHtml(serverVersion)}`;
+  }
 }
 
 function setSaveStatus(status, label = '') {
@@ -309,7 +408,11 @@ function scheduleSync(delay = 700) {
   pendingRefresh = setTimeout(fetchState, delay);
 }
 
-async function fetchState() {
+async function fetchState(options = {}) {
+  if (savePendingCount > 0 && !options.force) {
+    scheduleSync(1200);
+    return;
+  }
   const previousProgress = state ? {
     reputation: Number(state.progress?.reputation ?? state.user?.reputation ?? 0),
     recognition: Number(state.progress?.recognition ?? state.user?.recognition ?? 0)
@@ -336,9 +439,10 @@ async function fetchState() {
 
   if (!loadedAppVersion) {
     loadedAppVersion = data.version || window.GAME_VERSION || 'v0.4.16';
-  } else if (!versionMismatchShown && data.version && data.version !== loadedAppVersion) {
+  } else if (data.version && data.version !== loadedAppVersion) {
     versionMismatchShown = true;
-    showStatus(`New version available: ${data.version}. Reload to update.`, true);
+    latestServerVersion = data.version;
+    showPersistentUpdateWarning(data.version);
   }
 
   state = data;
@@ -367,6 +471,7 @@ async function fetchState() {
     moonIcon: data.clock?.moon_icon || '🌙'
   };
 
+  preloadLikelyBackgroundAssets();
   render();
   maybeOpenStoryEvent();
 }
@@ -403,7 +508,7 @@ function queueTrustedGardenSave(payload, options = {}) {
       if (!data.ok) throw new Error(data.error || 'Background save failed.');
       reconcileTrustedGardenSave(queuedPayload, data);
       markSaveComplete(true);
-      if (['plant', 'harvest', 'dig'].includes(queuedPayload.action)) scheduleSoftGardenRefresh(3500);
+      if (['plant', 'harvest', 'dig'].includes(queuedPayload.action)) scheduleSoftGardenRefresh(5000);
       return data;
     })
     .catch(err => {
@@ -531,6 +636,10 @@ function updateCanvasCursor() {
     canvas.style.cursor = 'crosshair';
     return;
   }
+  if (tab === 'garden' && state?.pouch && pointerCanvasPos && pouchHit(pointerCanvasPos)) {
+    canvas.style.cursor = 'grab';
+    return;
+  }
   canvas.style.cursor = tab === 'garden' ? 'none' : 'default';
 }
 
@@ -552,12 +661,23 @@ function cropAt(x, y) {
   return null;
 }
 
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    return [];
+  }
+}
+
 function iconForCrop(crop) {
-  const step = Number(crop.growth_step_current);
-  const max = Number(crop.growth_steps);
-  if (step <= 0) return state?.system_icons?.garden_planted_soil || 'assets/icons/garden-planted-soil.png';
-  if (step >= max) return crop.mature_icon || '🌾';
-  return crop.seed_icon || '🌱';
+  const step = Number(crop.growth_step_current || 0);
+  if (step <= 0) return systemIcon('garden_planted_soil', 'assets/icons/garden-planted-soil.png');
+  const stageIcons = parseJsonArray(crop.stage_icons_json);
+  if (stageIcons.length) return stageIcons[Math.min(stageIcons.length - 1, step - 1)] || stageIcons[stageIcons.length - 1];
+  return crop.mature_icon || crop.seed_icon || '🌱';
 }
 
 function cropIsMature(crop) {
@@ -569,9 +689,27 @@ function cropIsMature(crop) {
 
 function cropNeedsWater(crop) {
   if (!crop || cropIsMature(crop)) return false;
+  if (cropHasProblems(crop)) return false;
   const current = Number(crop.water_current || 0);
   const max = Number(crop.water_max || 100);
   return current < max;
+}
+
+function cropProblemsForCrop(crop) {
+  if (!crop) return [];
+  return (state?.crop_problems || []).filter(problem => String(problem.planted_crop_id) === String(crop.planted_crop_id));
+}
+
+function cropHasProblems(crop) {
+  return cropProblemsForCrop(crop).some(problem => Number(problem.is_resolved || 0) === 0);
+}
+
+function problemAtPoint(point) {
+  if (!point) return null;
+  return cropProblemHits.find(hit =>
+    point.x >= hit.x && point.x <= hit.x + hit.w &&
+    point.y >= hit.y && point.y <= hit.y + hit.h
+  )?.problem || null;
 }
 
 function countInventoryByItemId(itemId) {
@@ -697,7 +835,10 @@ function handleCanvasMove(evt) {
     if (showMapCoordinateTooltip(evt)) return;
     const hit = canvasSceneHits.find(h => pointerCanvasPos.x >= h.x && pointerCanvasPos.x <= h.x + h.w && pointerCanvasPos.y >= h.y && pointerCanvasPos.y <= h.y + h.h);
     const nextHover = hit?.id || null;
-    if (canvasHoverHitId !== nextHover) canvasHoverHitId = nextHover;
+    if (canvasHoverHitId !== nextHover) {
+      canvasHoverHitId = nextHover;
+      canvasHoverHitStartedAt = performance.now();
+    }
     if (hit?.tooltip) showTooltipHtml(hit.tooltip, evt);
     else hideTooltip();
     return;
@@ -724,6 +865,8 @@ function handleCanvasLeave() {
   pointerCanvasPos = null;
   hoverTile = null;
   hideTooltip();
+  canvasHoverHitId = null;
+  canvasHoverHitStartedAt = 0;
   stopRepeat();
 }
 
@@ -799,6 +942,7 @@ function performTileAction(hit, pointerPos = null, repeating = false) {
   if (selectedMode.type === 'tool' && selectedMode.value === 'watering_can') {
     if (!crop) return showStatus('Nothing to water.', true);
     if (cropIsMature(crop)) return showStatus('Fully grown crops do not need water.', true);
+    if (cropHasProblems(crop)) return showStatus('Clear pests or weeds first.', true);
     crop.water_current = Math.min(Number(crop.water_max || 100), Number(crop.water_current || 0) + Number(getTool('watering_can')?.strength || 15));
     render();
     doAction({ action: 'water', planted_crop_id: Number(crop.planted_crop_id), water_current: Number(crop.water_current || 0), garden_id: Number(state.garden?.garden_id || crop.garden_id || 0), origin_x: Number(crop.origin_x || 0), origin_y: Number(crop.origin_y || 0) }, { kind: 'water', ...fxPoint }, { silent: repeating });
@@ -844,7 +988,10 @@ function performTileAction(hit, pointerPos = null, repeating = false) {
       harvest_min: plant.harvest_min || '?',
       harvest_max: plant.harvest_max || '?',
       seed_icon: plant.seed_icon,
-      mature_icon: plant.mature_icon || plant.seed_icon
+      mature_icon: plant.mature_icon || plant.seed_icon,
+      stage_icons_json: plant.stage_icons_json || '[]',
+      has_weeds: 0,
+      has_pests: 0
     });
     render();
     doAction({
@@ -859,6 +1006,19 @@ function performTileAction(hit, pointerPos = null, repeating = false) {
   }
 
   if (selectedMode.type === 'harvest') {
+    const problem = problemAtPoint(pointerPos);
+    if (problem) {
+      state.crop_problems = (state.crop_problems || []).filter(p => Number(p.crop_problem_id) !== Number(problem.crop_problem_id));
+      const problemCrop = (state.crops || []).find(c => String(c.planted_crop_id) === String(problem.planted_crop_id));
+      if (problemCrop) {
+        problemCrop.has_weeds = cropProblemsForCrop(problemCrop).some(p => p.problem_type === 'weed') ? 1 : 0;
+        problemCrop.has_pests = cropProblemsForCrop(problemCrop).some(p => p.problem_type === 'pest') ? 1 : 0;
+      }
+      canvasFloatFx.push({ icon: problem.icon || (problem.problem_type === 'pest' ? '🐛' : '🌿'), text: '+1', x: fxPoint.x, y: fxPoint.y, createdAt: performance.now() });
+      render();
+      doAction({ action: 'harvest_crop_problem', crop_problem_id: Number(problem.crop_problem_id) }, { kind: 'harvest', ...fxPoint }, { silent: true });
+      return;
+    }
     if (!crop) return showStatus('Nothing to harvest.', true);
     if (Number(crop.growth_step_current || 0) < Number(crop.growth_steps || 0)) return showStatus('Not ready yet.', true);
     state.crops = (state.crops || []).filter(c => String(c.planted_crop_id) !== String(crop.planted_crop_id));
@@ -902,8 +1062,12 @@ function runClientHelperAutomation() {
 
     if (!target) {
       motion.targetCropId = null;
-      motion.targetX = null;
-      motion.targetY = null;
+      if (motion.targetX == null || motion.targetY == null || helperDistanceToDestination(helper) < 5) {
+        const idlePoint = helperOuterWanderPoint(0);
+        motion.targetX = idlePoint.x;
+        motion.targetY = idlePoint.y;
+        motion.arrived = false;
+      }
       continue;
     }
 
@@ -932,6 +1096,8 @@ function runClientHelperAutomation() {
       origin_y: Number(target.origin_y || 0),
       helper_id: Number(helper.player_helper_id || 0)
     }, { kind: 'water', ...fxPoint }, { silent: true });
+    if (cropNeedsWater(target)) setHelperDestination(helper, cropCanvasPoint(target), Number(target.planted_crop_id));
+    else motion.targetCropId = null;
     render();
   }
 }
@@ -993,11 +1159,12 @@ function drawSoilTile(plot, rect) {
 
   ctx.save();
   if (!unlocked) {
+    ctx.globalAlpha = .34;
     ctx.fillStyle = '#17140f';
     ctx.strokeStyle = 'rgba(255,255,255,.08)';
     fillStrokeRound(rect.x, rect.y, rect.size, rect.size, 10);
-    ctx.globalAlpha = .5;
-    drawIcon('🔒', rect.cx, rect.cy, rect.size * .22);
+    ctx.globalAlpha = .68;
+    drawIcon(state?.ui_config?.locked_plot_icon || '🔒', rect.cx, rect.cy, rect.size * .24);
     ctx.restore();
     return;
   }
@@ -1045,11 +1212,41 @@ function drawFertilizerOverlay(crop, rect) {
   ctx.restore();
 }
 
+function drawCropProblems(crop, rect) {
+  const problems = cropProblemsForCrop(crop).filter(problem => Number(problem.is_resolved || 0) === 0);
+  if (!problems.length) return;
+  const spots = [
+    [rect.x + rect.size * .24, rect.y + rect.size * .26],
+    [rect.x + rect.size * .72, rect.y + rect.size * .28],
+    [rect.x + rect.size * .30, rect.y + rect.size * .70],
+    [rect.x + rect.size * .68, rect.y + rect.size * .68],
+    [rect.cx, rect.y + rect.size * .18],
+    [rect.cx, rect.y + rect.size * .78]
+  ];
+  problems.forEach((problem, index) => {
+    const [x, y] = spots[index % spots.length];
+    const size = Math.max(18, rect.size * .18);
+    const bob = Math.sin((Date.now() / 420) + index) * 2;
+    ctx.save();
+    ctx.shadowColor = problem.problem_type === 'pest' ? 'rgba(255, 210, 120, .65)' : 'rgba(145, 236, 113, .65)';
+    ctx.shadowBlur = 8;
+    drawIcon(problem.icon || (problem.problem_type === 'pest' ? '🐛' : '🌿'), x, y + bob, size);
+    ctx.restore();
+    cropProblemHits.push({ problem, x: x - size / 2, y: y + bob - size / 2, w: size, h: size });
+  });
+}
+
 function drawCrop(crop, rect) {
   const mature = cropIsMature(crop);
   const waterRatio = Math.max(0, Math.min(1, Number(crop.water_current || 0) / Number(crop.water_max || 100)));
   ctx.save();
+  if (mature) {
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 520);
+    ctx.shadowColor = 'rgba(157, 236, 112, .76)';
+    ctx.shadowBlur = 10 + pulse * 8;
+  }
   drawIcon(iconForCrop(crop), rect.cx, rect.cy - 4, rect.size * .55);
+  ctx.shadowBlur = 0;
 
   if (!mature) {
     ctx.globalAlpha = .85;
@@ -1064,9 +1261,12 @@ function drawCrop(crop, rect) {
   }
 
   drawFertilizerOverlay(crop, rect);
+  drawCropProblems(crop, rect);
 
   if (mature) {
-    ctx.fillStyle = '#ffe6a0';
+    ctx.fillStyle = '#b9ef8e';
+    ctx.shadowColor = 'rgba(157, 236, 112, .8)';
+    ctx.shadowBlur = 8;
     ctx.beginPath();
     ctx.arc(rect.x + rect.size - 12, rect.y + 12, 7, 0, Math.PI * 2);
     ctx.fill();
@@ -1159,6 +1359,55 @@ function helperClientKey(helper) {
   );
 }
 
+
+function helperGardenBounds() {
+  if (!tileRects.length) {
+    return { left: 80, top: 80, right: canvasLogicalWidth() - 80, bottom: canvasLogicalHeight() - 80 };
+  }
+  const left = Math.min(...tileRects.map(t => Number(t.x || 0)));
+  const top = Math.min(...tileRects.map(t => Number(t.y || 0)));
+  const right = Math.max(...tileRects.map(t => Number(t.x || 0) + Number(t.size || 0)));
+  const bottom = Math.max(...tileRects.map(t => Number(t.y || 0) + Number(t.size || 0)));
+  return { left, top, right, bottom };
+}
+
+function helperOuterWanderPoint(index = 0) {
+  const b = helperGardenBounds();
+  const canvasW = canvasLogicalWidth();
+  const canvasH = canvasLogicalHeight();
+  const moat = 24;
+  const outer = 74;
+  const side = Math.floor(Math.random() * 4);
+  if (side === 0) {
+    return {
+      x: Math.max(34, Math.min(canvasW - 34, b.left - outer + Math.random() * ((b.right - b.left) + outer * 2))),
+      y: Math.max(34, b.top - moat - Math.random() * outer)
+    };
+  }
+  if (side === 1) {
+    return {
+      x: Math.min(canvasW - 34, b.right + moat + Math.random() * outer),
+      y: Math.max(34, Math.min(canvasH - 34, b.top - outer + Math.random() * ((b.bottom - b.top) + outer * 2)))
+    };
+  }
+  if (side === 2) {
+    return {
+      x: Math.max(34, Math.min(canvasW - 34, b.left - outer + Math.random() * ((b.right - b.left) + outer * 2))),
+      y: Math.min(canvasH - 34, b.bottom + moat + Math.random() * outer)
+    };
+  }
+  return {
+    x: Math.max(34, b.left - moat - Math.random() * outer),
+    y: Math.max(34, Math.min(canvasH - 34, b.top - outer + Math.random() * ((b.bottom - b.top) + outer * 2)))
+  };
+}
+
+function helperHasActiveCropTarget(helper) {
+  const motion = ensureHelperMotion(helper);
+  if (motion.targetCropId == null) return false;
+  return (state.crops || []).some(c => Number(c.planted_crop_id) === Number(motion.targetCropId) && cropNeedsWater(c));
+}
+
 function cropCanvasPoint(crop) {
   if (!crop) return { x: canvasLogicalWidth() / 2, y: canvasLogicalHeight() / 2 };
 
@@ -1183,8 +1432,9 @@ function cropCanvasPoint(crop) {
 function ensureHelperMotion(helper, index = 0) {
   const key = helperClientKey(helper);
   if (!helperClientMotion[key]) {
-    const baseX = canvasLogicalWidth() / 2 + (index % 3 - 1) * 34;
-    const baseY = canvasLogicalHeight() / 2 + Math.floor(index / 3) * 28;
+    const idleStart = helperOuterWanderPoint(index);
+    const baseX = idleStart.x;
+    const baseY = idleStart.y;
     helperClientMotion[key] = {
       x: Number(helper?.x ?? helper?.map_x ?? baseX),
       y: Number(helper?.y ?? helper?.map_y ?? baseY),
@@ -1208,22 +1458,16 @@ function ensureHelperMotion(helper, index = 0) {
 function setHelperDestination(helper, point, targetCropId = null) {
   if (!helper || !point) return;
   const motion = ensureHelperMotion(helper);
-  motion.targetX = Number(point.x);
-  motion.targetY = Number(point.y);
+  const jitter = targetCropId ? 18 : 0;
+  motion.targetX = Number(point.x) + (Math.random() - .5) * jitter;
+  motion.targetY = Number(point.y) + (Math.random() - .5) * jitter;
   motion.targetCropId = targetCropId;
   motion.arrived = false;
 }
 
 
 function helperIdleWanderPoint(index = 0) {
-  const w = canvasLogicalWidth();
-  const h = canvasLogicalHeight();
-  const margin = 48;
-  const side = Math.floor(Math.random() * 4);
-  if (side === 0) return { x: margin + Math.random() * (w - margin * 2), y: margin + Math.random() * 70 };
-  if (side === 1) return { x: w - margin - Math.random() * 70, y: margin + Math.random() * (h - margin * 2) };
-  if (side === 2) return { x: margin + Math.random() * (w - margin * 2), y: h - margin - Math.random() * 70 };
-  return { x: margin + Math.random() * 70, y: margin + Math.random() * (h - margin * 2) };
+  return helperOuterWanderPoint(index);
 }
 
 function maybeSetIdleHelperWander(helper, index = 0, now = performance.now()) {
@@ -1237,7 +1481,7 @@ function maybeSetIdleHelperWander(helper, index = 0, now = performance.now()) {
   motion.targetY = point.y;
   motion.targetCropId = null;
   motion.arrived = false;
-  motion.nextWanderAt = now + 1600 + Math.random() * 2800;
+  motion.nextWanderAt = now + 900 + Math.random() * 2600;
 }
 
 function helperDistanceToDestination(helper) {
@@ -1278,6 +1522,34 @@ function updateHelperMotion(helper, index = 0, now = performance.now()) {
   return motion;
 }
 
+
+function helperDrawSize() {
+  const tileSize = tileRects.length ? Math.min(...tileRects.map(t => Number(t.size || 48))) : 48;
+  const bonus = Math.max(0, 58 - tileSize) * .42;
+  return Math.round(Math.max(30, Math.min(50, 30 + bonus)));
+}
+
+function helperWorkSprite(helper) {
+  return helper?.work_sprite || helper?.equipment_work_sprite || helper?.equipment_icon || helper?.equipped_icon || '✨';
+}
+
+function drawHelperWorkPops(helper, x, y, now, size) {
+  const task = helper.active_task || helper.task_type || 'idle';
+  if (task === 'idle' || !helperHasActiveCropTarget(helper)) return;
+  const sprite = helperWorkSprite(helper);
+  const count = 3;
+  for (let i = 0; i < count; i++) {
+    const phase = ((now / 900) + i / count) % 1;
+    const angle = (i * Math.PI * 2 / count) + now / 1300;
+    const px = x + Math.cos(angle) * (size * .55) + Math.sin(now / 300 + i) * 3;
+    const py = y - 12 - phase * (size * .9) + Math.sin(angle) * 4;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, .82 - phase * .82);
+    drawIcon(sprite, px, py, Math.max(16, size * .45));
+    ctx.restore();
+  }
+}
+
 function drawGardenHelpers() {
   const helpers = (state?.helpers || []).filter(h => Number(h.is_enabled ?? 1));
   if (!helpers.length) return;
@@ -1287,14 +1559,16 @@ function drawGardenHelpers() {
     const motion = updateHelperMotion(helper, index, now);
     const task = helper.active_task || helper.task_type || 'idle';
     const speed = Math.max(6, Number(helper.speed_rating || 10));
-    const bob = Math.sin(now / (520 - Math.min(260, speed * 12)) + index) * (task === 'idle' ? 5 : 3);
-    const sway = Math.cos(now / (760 - Math.min(300, speed * 12)) + index * 1.7) * (task === 'idle' ? 4 : 2);
-    const isWorking = task !== 'idle' && helperDistanceToDestination(helper) <= 20;
+    const bob = Math.sin(now / (520 - Math.min(260, speed * 12)) + index) * (task === 'idle' ? 5 : 7);
+    const sway = Math.cos(now / (760 - Math.min(300, speed * 12)) + index * 1.7) * (task === 'idle' ? 4 : 6);
+    const isWorking = task !== 'idle' && helperHasActiveCropTarget(helper) && helperDistanceToDestination(helper) <= 24;
     ctx.save();
     ctx.globalAlpha = .94;
     ctx.shadowColor = 'rgba(255, 214, 94, .55)';
     ctx.shadowBlur = isWorking ? 13 : 7;
-    drawIcon(helper.icon || '🧚', motion.x + sway, motion.y + bob, 28);
+    const drawSize = helperDrawSize();
+    drawIcon(helper.icon || '🧚', motion.x + sway, motion.y + bob, drawSize);
+    if (isWorking) drawHelperWorkPops(helper, motion.x + sway, motion.y + bob, now, drawSize);
     ctx.restore();
   });
 }
@@ -1317,9 +1591,9 @@ function drawToolCursor() {
   if (isModalOpen() || currentTabName() !== 'garden' || !pointerCanvasPos) return;
   let icon = null;
   if (selectedMode.type === 'tool') icon = getTool(selectedMode.value)?.icon || '✦';
-  if (selectedMode.type === 'harvest') icon = '🧺';
-  if (selectedMode.type === 'seed') icon = selectedPlant()?.seed_icon || '🌱';
-  if (selectedMode.type === 'info') icon = '🔎';
+  if (selectedMode.type === 'harvest') icon = harvestToolIcon();
+  if (selectedMode.type === 'seed') icon = selectedPlant()?.seed_icon || '';
+  if (selectedMode.type === 'info') icon = inspectToolIcon();
   if (icon) drawIcon(icon, pointerCanvasPos.x + 20, pointerCanvasPos.y + 20, 30);
 }
 
@@ -1328,7 +1602,8 @@ function drawFx() {
   lastFx = lastFx.filter(fx => now - fx.createdAt < 650);
   for (const fx of lastFx) {
     const t = (now - fx.createdAt) / 650;
-    const icon = { water: '💧', till: '💢', plant: '✨', harvest: '✦', dig: '🪨', pouch: '💨', relic: '🔹' }[fx.kind] || '✦';
+    const icon = fx.icon || actionFxIcon(fx.kind);
+    if (!icon) continue;
     ctx.save();
     ctx.globalAlpha = 1 - t;
     drawIcon(icon, fx.x, fx.y - t * 32, 30);
@@ -1395,7 +1670,11 @@ function triggerScreenTransition() {
 function switchScreen(tab) {
   if (!tab) tab = 'map';
   if (tab !== 'garden') clearGardenInteractionState();
+  canvasHoverHitId = null;
+  canvasHoverHitStartedAt = 0;
+  if (tab !== 'helpers') helperCanvasScroll = 0;
   activeScreen = tab;
+  preloadAssetsForScreen(tab);
   triggerScreenTransition();
   updateScreenSurfaceVisibility();
   updateBgmForScreen();
@@ -1448,12 +1727,145 @@ function getMapButtonPositions() {
   return defaults;
 }
 
+function mapMarkerAliasesForKey(key) {
+  const aliases = {
+    shop: ['shop', 'store', 'general_store'],
+    helpers: ['helpers', 'forest_folk'],
+    market: ['market', 'fae_market'],
+    bone_brine: ['bone_brine', 'bone_brine_shop'],
+    shed: ['shed', 'workroom']
+  };
+  return aliases[key] || [key];
+}
+
+function markerBackgroundAssets(marker = {}) {
+  if (!marker || typeof marker !== 'object') return [];
+  return [
+    marker.background_image,
+    marker.day_background_image,
+    marker.background_day_image,
+    marker.night_background_image,
+    marker.background_night_image,
+    marker.active_day_background_image,
+    marker.active_night_background_image,
+    marker.inactive_day_background_image,
+    marker.inactive_night_background_image
+  ].filter(Boolean);
+}
+
+function firstUsableBackground(candidates = []) {
+  const unique = [...new Set((candidates || []).filter(Boolean))];
+  return unique.find(src => !imageCache[src]?.failed) || unique[0] || '';
+}
+
+function markerCurrentBackgroundAsset(marker = {}, options = {}) {
+  const dayBg = marker.day_background_image || marker.background_day_image || marker.background_image || '';
+  const nightBg = marker.night_background_image || marker.background_night_image || dayBg;
+  return (options.forceDay || isDayPhaseNow()) ? dayBg : (nightBg || dayBg);
+}
+
+function gardenBackgroundForNow() {
+  const garden = state?.garden || {};
+  const typeCode = garden.garden_type_code || 'farm';
+  const dayBg = garden.day_background_image || `assets/gardens/garden_day_${typeCode}.png`;
+  const nightBg = garden.night_background_image || `assets/gardens/garden_night_${typeCode}.png`;
+  const selected = isDayPhaseNow() ? dayBg : nightBg;
+  return firstUsableBackground([selected, locationBackgroundForNow('garden'), 'assets/map/garden.png']);
+}
+
+function mapBackgroundForNow() {
+  const cfg = state?.map_config || {};
+  const dayBg = cfg.day_background_image || 'assets/map/map_day.png';
+  const nightBg = cfg.night_background_image || 'assets/map/map_night.png';
+  const selected = isDayPhaseNow() ? dayBg : nightBg;
+  return firstUsableBackground([selected, cfg.background_image, 'assets/map/background.png']);
+}
+
+function isCaravanActive() {
+  return !!state?.caravan_status?.is_active;
+}
+
+function caravanBackgroundForNow() {
+  const marker = locationMarkerConfig('caravan');
+  const active = isCaravanActive();
+  const phase = isDayPhaseNow() ? 'day' : 'night';
+  const configured = active
+    ? (phase === 'day' ? marker.active_day_background_image : marker.active_night_background_image)
+    : (phase === 'day' ? marker.inactive_day_background_image : marker.inactive_night_background_image);
+  const generic = markerCurrentBackgroundAsset(marker);
+  const named = active
+    ? (phase === 'day' ? 'assets/map/caravan_full_day.png' : 'assets/map/caravan_full_night.png')
+    : (phase === 'day' ? 'assets/map/caravan_empty_day.png' : 'assets/map/caravan_empty_night.png');
+  const fallback = active ? 'assets/map/caravan_full.png' : 'assets/map/caravan_empty.png';
+  return firstUsableBackground([configured, named, generic, fallback]);
+}
+
+function preloadAssetsForScreen(tab = currentTabName()) {
+  if (!state) return;
+  const assets = [];
+  assets.push(mapBackgroundForNow(), state?.map_config?.background_image || '', state?.map_config?.day_background_image || 'assets/map/map_day.png', state?.map_config?.night_background_image || 'assets/map/map_night.png');
+
+  if (tab === 'map') {
+    for (const loc of state.locations || []) {
+      const marker = configuredMapMarkerForKey(loc.key);
+      assets.push(marker.icon || loc.icon || fallbackMapIconForKey(loc.key), marker.active_map_icon || '', marker.inactive_map_icon || '');
+      if (loc.key === 'caravan') assets.push(caravanBackgroundForNow(), 'assets/map/caravan_full_day.png', 'assets/map/caravan_full_night.png', 'assets/map/caravan_empty_day.png', 'assets/map/caravan_empty_night.png', 'assets/map/caravan_full.png', 'assets/map/caravan_empty.png');
+      else if (loc.key === 'garden') assets.push(gardenBackgroundForNow());
+      else assets.push(markerCurrentBackgroundAsset(marker, { forceDay: loc.key === 'shop' && !hasUnlockKey('location_market') }));
+    }
+  } else {
+    const marker = configuredMapMarkerForKey(tab);
+    assets.push(marker.icon || fallbackMapIconForKey(tab), marker.active_map_icon || '', marker.inactive_map_icon || '');
+    assets.push(...markerBackgroundAssets(marker));
+    if (tab === 'caravan') assets.push(caravanBackgroundForNow(), 'assets/map/caravan_full_day.png', 'assets/map/caravan_full_night.png', 'assets/map/caravan_empty_day.png', 'assets/map/caravan_empty_night.png', 'assets/map/caravan_full.png', 'assets/map/caravan_empty.png');
+    if (tab === 'garden') assets.push(gardenBackgroundForNow());
+    if (tab === 'market') {
+      assets.push('assets/market/closed.png');
+      for (let i = 1; i <= marketWandererImageCount(); i++) assets.push(`assets/market/fae/fae${i}.png`);
+    }
+  }
+
+  preloadImageAssets(assets);
+}
+
+function preloadLikelyBackgroundAssets() {
+  if (!state) return;
+  preloadAssetsForScreen(currentTabName());
+}
+
+function configuredMapMarkerForKey(key) {
+  const markers = state?.map_config?.location_markers || {};
+  for (const markerKey of mapMarkerAliasesForKey(key)) {
+    if (markers[markerKey]) return markers[markerKey];
+  }
+  return {};
+}
+
+function fallbackMapIconForKey(key) {
+  const fallbackIcons = {
+    garden: 'assets/map/garden.png',
+    shop: 'assets/map/store.png',
+    orders: 'assets/map/orders.png',
+    shed: 'assets/map/shed.png',
+    market: 'assets/map/market.png',
+    caravan: 'assets/map/caravan_empty.png',
+    bone_brine: 'assets/map/bone_brine.png',
+    helpers: 'assets/map/fairy_folk.png'
+  };
+  return fallbackIcons[key] || `assets/map/${key}.png`;
+}
+
 function mapMarkerForLocation(loc) {
-  const marker = state?.map_config?.location_markers?.[loc.key] || {};
+  const marker = configuredMapMarkerForKey(loc.key);
+  const configuredIcon = marker.icon || '';
+  const dynamicIcon = loc.key === 'caravan'
+    ? (isCaravanActive() ? (marker.active_map_icon || loc.icon) : (marker.inactive_map_icon || loc.icon))
+    : loc.icon;
+  const icon = dynamicIcon || configuredIcon || fallbackMapIconForKey(loc.key) || '❔';
   return {
-    icon: marker.icon || loc.icon || `assets/map/${loc.key}.png` || '❔',
+    icon,
     size: Number(marker.size || marker.icon_size || 78),
-    glowColor: marker.glow_color || 'rgba(255, 214, 94, .78)'
+    glowColor: isDayPhaseNow() ? (marker.glow_color || 'rgba(255, 214, 94, .78)') : 'rgba(164, 132, 255, .82)'
   };
 }
 
@@ -1462,24 +1874,20 @@ function drawMapMarkerIcon(icon, x, y, size, locked = false) {
   if (locked && isImageIcon(icon)) {
     ctx.filter = 'brightness(0) saturate(100%)';
     ctx.globalAlpha = .9;
+  } else if (!isDayPhaseNow() && isImageIcon(icon)) {
+    ctx.filter = 'brightness(.82) saturate(1.08) hue-rotate(18deg)';
   } else if (locked) {
     ctx.globalAlpha = .35;
     icon = '?';
   }
-  if (icon && isImageIcon(icon) && !imageCache[icon]) {
-    const img = new Image();
-    img.src = icon;
-    imageCache[icon] = img;
-    img.onerror = () => { imageCache[icon].failed = true; render(); };
-    img.onload = () => render();
-  }
+  if (icon && isImageIcon(icon) && !imageCache[icon]) preloadImageAsset(icon);
   if (icon && isImageIcon(icon) && imageCache[icon]?.failed) icon = '🗺️';
   drawIcon(icon, x, y, size);
   ctx.restore();
 }
 
 function drawMapBackground() {
-  const bg = state?.map_config?.background_image || '';
+  const bg = mapBackgroundForNow();
   if (!bg || !isImageIcon(bg)) {
     drawPanelBackground('🗺️');
     return;
@@ -1493,13 +1901,11 @@ function drawMapBackground() {
 
   let img = imageCache[bg];
   if (!img) {
-    img = new Image();
-    img.src = bg;
-    img.onload = () => render();
-    imageCache[bg] = img;
+    preloadImageAsset(bg);
+    img = imageCache[bg];
   }
 
-  if (img.complete && img.naturalWidth) {
+  if (img?.complete && img.naturalWidth && !img.failed) {
     ctx.save();
     roundedPath(10, 10, canvasLogicalWidth() - 20, canvasLogicalHeight() - 20, 22);
     ctx.clip();
@@ -1593,17 +1999,6 @@ function drawMapCanvas() {
   drawMapBackground();
   const locations = state.locations || [];
   const positions = getMapButtonPositions();
-  ctx.fillStyle = '#f2d28b';
-  ctx.font = '800 22px system-ui';
-  ctx.textAlign = 'center';
-  ctx.shadowColor = 'rgba(0,0,0,.9)';
-  ctx.shadowBlur = 4;
-  ctx.fillText(state.map_config?.title || 'Town', canvasLogicalWidth() / 2, 62);
-  ctx.font = '14px system-ui';
-  ctx.fillStyle = '#eadbbf';
-  ctx.fillText('A tiny town, a suspicious garden, and several locked problems.', canvasLogicalWidth() / 2, 86);
-  ctx.shadowBlur = 0;
-
   if (isCtrlDown && pointerCanvasPos) {
     const pos = roundedPointerPos();
     ctx.save();
@@ -1895,18 +2290,16 @@ function openMachineStationModal(station) {
 
 function drawShedCanvas() {
   canvasSceneHits = [];
-  const bg = state?.shed?.background_image || '';
-  if (bg && imageCache[bg]?.complete) {
-    ctx.drawImage(imageCache[bg], 0, 0, canvasLogicalWidth(), canvasLogicalHeight());
-  } else {
-    drawPanelBackground('🛖');
+  const shedMarker = locationMarkerConfig('shed');
+  const bg = state?.shed?.background_image || locationBackgroundForNow('shed');
+  drawPanelBackground(shedMarker.icon || '🛖', bg);
+  if (!bg) {
     ctx.save();
     ctx.fillStyle = 'rgba(80, 53, 31, .35)';
     ctx.fillRect(70, 92, canvasLogicalWidth() - 140, 210);
     ctx.fillStyle = 'rgba(67, 43, 26, .5)';
     ctx.fillRect(70, 310, canvasLogicalWidth() - 140, 300);
     ctx.restore();
-    if (bg && !imageCache[bg]) { const img = new Image(); img.src = bg; img.onload = () => render(); imageCache[bg] = img; }
   }
 
   ctx.save();
@@ -1982,7 +2375,7 @@ function handleShedMouseUp() {
 
 function drawOrdersCanvas() {
   canvasSceneHits = [];
-  drawPanelBackground('📜');
+  drawPanelBackground(ordersIcon(), locationBackgroundForNow('orders'));
   ctx.fillStyle = '#d9a441';
   ctx.font = '800 22px system-ui';
   ctx.textAlign = 'center';
@@ -2077,15 +2470,17 @@ function equipHelperAccessoryLocal(helperId, equipmentId) {
 
 function drawHelpersCanvas() {
   canvasSceneHits = [];
-  drawPanelBackground('🧚');
+  drawPanelBackground(locationIconFor('helpers', '🧚', ['forest_folk']), locationBackgroundForNow('helpers', ['forest_folk']));
   const unlocked = hasUnlockKey('helpers_unlocked');
+
+  drawCanvasSlot(118, 48, canvasLogicalWidth() - 236, 58, { fill: 'rgba(18,13,9,.58)', stroke: 'rgba(217,164,65,.28)' });
   ctx.fillStyle = '#d9a441';
   ctx.font = '800 22px system-ui';
   ctx.textAlign = 'center';
-  ctx.fillText('Forest Folk', canvasLogicalWidth() / 2, 62);
-  ctx.font = '15px system-ui';
-  ctx.fillStyle = '#b8a88f';
-  ctx.fillText(unlocked ? 'Drag an owned accessory onto a helper slot to assign a job.' : 'Ring the bell to summon your first helper.', canvasLogicalWidth() / 2, 90);
+  ctx.fillText('Forest Folk', canvasLogicalWidth() / 2, 76);
+  ctx.font = '14px system-ui';
+  ctx.fillStyle = '#e7d7bd';
+  ctx.fillText(unlocked ? 'Drag an owned accessory onto a helper slot to assign a job.' : 'Ring the bell to summon your first helper.', canvasLogicalWidth() / 2, 98);
 
   if (!unlocked) {
     const hasBell = !!inventoryItemByCode('fairy_bell');
@@ -2105,54 +2500,102 @@ function drawHelpersCanvas() {
 
   const helpers = state.helpers || [];
   const accessories = state.helper_accessories || [];
-  const cardX = 52, cardY = 126, cardW = canvasLogicalWidth() - 104, cardH = 132;
-  helpers.forEach((helper, index) => {
-    const y = cardY + index * 148;
-    drawCanvasSlot(cardX, y, cardW, cardH, { stroke: 'rgba(143,196,107,.26)' });
-    drawIcon(helper.icon || 'assets/icons/helpers/fairy.png', cardX + 58, y + 66, 56);
-    ctx.textAlign = 'left';
-    ctx.font = '800 19px system-ui';
-    ctx.fillStyle = '#f5ead8';
-    ctx.fillText(helper.helper_name || 'Unnamed Helper', cardX + 110, y + 38);
-    ctx.font = '14px system-ui';
-    ctx.fillStyle = '#b8a88f';
-    ctx.fillText(`${helper.name || helper.species_key || 'Forest Folk'} · Job: ${helper.active_task || 'idle'}`, cardX + 110, y + 62);
-    ctx.fillText(`Speed ${helper.speed_rating || 10} · Effectiveness ${helper.effectiveness_rating || 10}`, cardX + 110, y + 84);
+  const listX = 42, listY = 126, listW = canvasLogicalWidth() - 84, listH = canvasLogicalHeight() - 300;
+  drawCanvasSlot(listX, listY, listW, listH, { fill: 'rgba(18,13,9,.34)', stroke: 'rgba(143,196,107,.25)' });
 
-    const slotX = cardX + cardW - 142, slotY = y + 24, slot = 84;
+  const cardGap = 12;
+  const cardW = Math.floor((listW - 36 - cardGap) / 2);
+  const cardH = 112;
+  const cols = 2;
+  const rows = Math.ceil(helpers.length / cols);
+  const contentH = rows * (cardH + cardGap) - cardGap;
+  const maxScroll = Math.max(0, contentH - (listH - 28));
+  helperCanvasScroll = Math.max(0, Math.min(maxScroll, helperCanvasScroll));
+
+  ctx.save();
+  roundedPath(listX + 10, listY + 10, listW - 20, listH - 20, 16);
+  ctx.clip();
+  helpers.forEach((helper, index) => {
+    const col = index % cols;
+    const row = Math.floor(index / cols);
+    const x = listX + 18 + col * (cardW + cardGap);
+    const y = listY + 16 + row * (cardH + cardGap) - helperCanvasScroll;
+    if (y > listY + listH || y + cardH < listY) return;
+    drawCanvasSlot(x, y, cardW, cardH, { fill: 'rgba(18,13,9,.66)', stroke: 'rgba(143,196,107,.34)' });
+    const iconX = x + 44, iconY = y + 56;
+    drawIcon(helper.icon || 'assets/icons/helpers/fairy.png', iconX, iconY, 58);
+    canvasSceneHits.push({ id: `helper-portrait:${helper.player_helper_id}`, x: iconX - 34, y: iconY - 34, w: 68, h: 68, popoutIcon: helper.icon || 'assets/icons/helpers/fairy.png', tooltip: `<b>${escapeHtml(helper.helper_name || 'Unnamed Helper')}</b><br><span class="muted-line">Hovering gives a closer look.</span>` });
+    ctx.textAlign = 'left';
+    ctx.font = '800 16px system-ui';
+    ctx.fillStyle = '#f5ead8';
+    ctx.fillText(helper.helper_name || 'Unnamed Helper', x + 84, y + 32);
+    ctx.font = '13px system-ui';
+    ctx.fillStyle = '#b8a88f';
+    ctx.fillText(`${helper.name || helper.species_key || 'Forest Folk'}`, x + 84, y + 54);
+    ctx.fillText(`Job: ${helper.active_task || 'idle'}`, x + 84, y + 74);
+
+    const slot = 54, slotX = x + cardW - slot - 12, slotY = y + cardH - slot - 12;
     drawCanvasSlot(slotX, slotY, slot, slot, { stroke: 'rgba(255,230,160,.28)', fill: 'rgba(255,255,255,.035)' });
     const equippedIcon = helper.equipment_icon || helper.equipped_icon || null;
-    if (equippedIcon) drawIcon(equippedIcon, slotX + slot / 2, slotY + slot / 2 - 6, 42);
+    if (equippedIcon) drawIcon(equippedIcon, slotX + slot / 2, slotY + slot / 2, 34);
     else {
       ctx.textAlign = 'center';
-      ctx.font = '800 26px system-ui';
+      ctx.font = '800 24px system-ui';
       ctx.fillStyle = '#b8a88f';
-      ctx.fillText('+', slotX + slot / 2, slotY + slot / 2 + 6);
+      ctx.fillText('+', slotX + slot / 2, slotY + slot / 2 + 8);
     }
-    ctx.font = '12px system-ui';
-    ctx.fillStyle = '#b8a88f';
-    ctx.fillText('Accessory', slotX + slot / 2, slotY + slot + 18);
     canvasSceneHits.push({ id: `helper-slot:${helper.player_helper_id}`, x: slotX, y: slotY, w: slot, h: slot, equipHelperId: Number(helper.player_helper_id), tooltip: '<b>Accessory Slot</b><br><span class="muted-line">Drag an owned accessory here to assign it.</span>' });
   });
+  ctx.restore();
+
+  if (maxScroll > 0) {
+    const trackX = listX + listW - 15, trackY = listY + 18, trackH = listH - 36;
+    ctx.fillStyle = 'rgba(255,255,255,.12)';
+    fillStrokeRound(trackX, trackY, 5, trackH, 4);
+    const thumbH = Math.max(34, trackH * ((listH - 28) / contentH));
+    const thumbY = trackY + (trackH - thumbH) * (helperCanvasScroll / maxScroll);
+    ctx.fillStyle = 'rgba(217,164,65,.58)';
+    fillStrokeRound(trackX, thumbY, 5, thumbH, 4);
+  }
 
   const shelfY = canvasLogicalHeight() - 142;
+  drawCanvasSlot(42, shelfY - 42, canvasLogicalWidth() - 84, 122, { fill: 'rgba(18,13,9,.54)', stroke: 'rgba(217,164,65,.30)' });
   ctx.textAlign = 'left';
   ctx.font = '800 16px system-ui';
   ctx.fillStyle = '#ffe6a0';
-  ctx.fillText('Owned Accessories', 52, shelfY - 18);
-  const slot = 78, gap = 12;
+  ctx.fillText('Owned Accessories', 62, shelfY - 18);
+  const slot = 70, gap = 12;
   accessories.forEach((acc, index) => {
-    const x = 52 + index * (slot + gap);
+    const x = 62 + index * (slot + gap);
     const owned = Number(acc.owned_quantity ?? (acc.code === 'aqua_amulet' ? 1 : 0));
     const unavailable = owned < 1;
     drawCanvasSlot(x, shelfY, slot, slot, { alpha: unavailable ? .42 : 1, stroke: unavailable ? 'rgba(255,255,255,.08)' : 'rgba(217,164,65,.28)' });
-    drawIcon(acc.icon || acc.item_icon || '✨', x + slot / 2, shelfY + slot / 2 - 7, 38);
+    drawIcon(acc.icon || acc.item_icon || '✨', x + slot / 2, shelfY + slot / 2 - 7, 36);
     ctx.textAlign = 'center';
-    ctx.font = '11px system-ui';
+    ctx.font = '10px system-ui';
     ctx.fillStyle = '#f5ead8';
     ctx.fillText(acc.name || 'Accessory', x + slot / 2, shelfY + slot - 8);
     if (!unavailable) canvasSceneHits.push({ id: `accessory:${acc.helper_equipment_id}`, x, y: shelfY, w: slot, h: slot, dragAccessory: { equipmentId: Number(acc.helper_equipment_id), icon: acc.icon || acc.item_icon || '✨', name: acc.name || 'Accessory' }, tooltip: `<b>${escapeHtml(acc.name || 'Accessory')}</b><br><span class="muted-line">Drag onto a helper slot to assign ${escapeHtml(acc.task_type || 'job')}.</span>` });
   });
+
+  drawCanvasHoverPopout();
+}
+
+function drawCanvasHoverPopout() {
+  if (!canvasHoverHitId) return;
+  const hit = canvasSceneHits.find(h => h.id === canvasHoverHitId && h.popoutIcon);
+  if (!hit) return;
+  const age = performance.now() - (canvasHoverHitStartedAt || performance.now());
+  const t = Math.min(1, age / 260);
+  const eased = 1 - Math.pow(1 - t, 3);
+  const size = 92 + eased * 26;
+  const x = Math.min(canvasLogicalWidth() - size / 2 - 28, hit.x + hit.w + 74);
+  const y = Math.max(size / 2 + 20, Math.min(canvasLogicalHeight() - size / 2 - 20, hit.y + hit.h / 2));
+  ctx.save();
+  ctx.globalAlpha = .92 * eased;
+  drawCanvasSlot(x - size / 2 - 10, y - size / 2 - 10, size + 20, size + 20, { fill: 'rgba(18,13,9,.72)', stroke: 'rgba(255,230,160,.36)' });
+  drawIcon(hit.popoutIcon, x, y, size);
+  ctx.restore();
 }
 
 function wrapCanvasText(text, x, y, maxWidth, lineHeight) {
@@ -2275,7 +2718,9 @@ function weeklySpecialItems() {
 
 function drawShopCanvas() {
   canvasSceneHits = [];
-  drawPanelBackground('🏪');
+  const hideSecretNight = !hasUnlockKey('location_market');
+  const shopIcon = locationIconFor('shop', '🏪', ['store', 'general_store']);
+  drawPanelBackground(shopIcon, locationBackgroundForNow('shop', ['store', 'general_store'], { forceDay: hideSecretNight }));
   const rows = [
     { title: '🌱', y: 58, items: (state.plants || []).map(p => ({ plant: p, icon: p.seed_icon, name: p.seed_name || p.name, price: Number(p.base_buy_price || 0), action: () => buySeedFromCanvas(p) })) },
     { title: '🛠️', y: 248, items: (state.all_machines || []).map(m => ({ machine: m, icon: m.icon, name: m.name, price: Number(m.base_cost || 0), action: () => buyMachineFromCanvas(m) })) },
@@ -2315,27 +2760,295 @@ function drawShopCanvas() {
   }
 }
 
-function drawPanelBackground(icon) {
+function drawPanelBackgroundLayer(backgroundImage = '', alpha = 1) {
   ctx.save();
+  ctx.globalAlpha = alpha;
   ctx.fillStyle = '#211a13';
   ctx.strokeStyle = 'rgba(255,255,255,.08)';
   ctx.lineWidth = 2;
   fillStrokeRound(8, 8, canvasLogicalWidth() - 16, canvasLogicalHeight() - 16, 24);
+
+  if (backgroundImage && isImageIcon(backgroundImage)) {
+    let img = imageCache[backgroundImage];
+    if (!img) {
+      preloadImageAsset(backgroundImage);
+      img = imageCache[backgroundImage];
+    }
+    if (img?.complete && img.naturalWidth && !img.failed) {
+      roundedPath(10, 10, canvasLogicalWidth() - 20, canvasLogicalHeight() - 20, 22);
+      ctx.clip();
+      const scale = Math.max((canvasLogicalWidth() - 20) / img.naturalWidth, (canvasLogicalHeight() - 20) / img.naturalHeight);
+      const w = img.naturalWidth * scale;
+      const h = img.naturalHeight * scale;
+      ctx.globalAlpha = alpha * .86;
+      ctx.drawImage(img, 10 + ((canvasLogicalWidth() - 20) - w) / 2, 10 + ((canvasLogicalHeight() - 20) - h) / 2, w, h);
+      ctx.globalAlpha = alpha * .32;
+      ctx.fillStyle = '#120f0b';
+      ctx.fillRect(10, 10, canvasLogicalWidth() - 20, canvasLogicalHeight() - 20);
+    }
+  }
+  ctx.restore();
+}
+
+function drawPanelBackground(icon, backgroundImage = '') {
+  if (backgroundImage !== panelBackgroundImage) {
+    const sameScreen = panelBackgroundScreen === currentTabName();
+    panelBackgroundPrevImage = panelBackgroundImage;
+    panelBackgroundImage = backgroundImage;
+    panelBackgroundScreen = currentTabName();
+    panelBackgroundTransitionMs = sameScreen ? STATE_BACKGROUND_TRANSITION_MS : LOCATION_BACKGROUND_TRANSITION_MS;
+    panelBackgroundTransitionStartedAt = performance.now();
+  }
+
+  if (panelBackgroundPrevImage && panelBackgroundTransitionStartedAt) {
+    drawPanelBackgroundLayer(panelBackgroundPrevImage, 1);
+    const alpha = Math.min(1, (performance.now() - panelBackgroundTransitionStartedAt) / panelBackgroundTransitionMs);
+    drawPanelBackgroundLayer(panelBackgroundImage, alpha);
+    if (alpha >= 1) panelBackgroundPrevImage = '';
+  } else {
+    drawPanelBackgroundLayer(panelBackgroundImage, 1);
+  }
+
+  ctx.save();
   drawIcon(icon, 52, 46, 38);
   ctx.restore();
 }
 
-function drawSimpleScene(label, icon) {
+function locationMarkerConfig(key) {
+  return configuredMapMarkerForKey(key);
+}
+
+function isDayPhaseNow() {
+  const snap = gameClockSnapshot?.();
+  const hour = Number(snap?.hour ?? 12);
+  return hour >= 6 && hour < 18;
+}
+
+function locationBackgroundForNow(key, aliases = [], options = {}) {
+  if (key === 'caravan' || (Array.isArray(aliases) && aliases.includes('caravan'))) return caravanBackgroundForNow();
+  const keys = [key].concat(Array.isArray(aliases) ? aliases : [aliases]).filter(Boolean);
+  const forceDay = !!options.forceDay;
+  for (const locKey of keys) {
+    const marker = locationMarkerConfig(locKey);
+    if (!marker || !Object.keys(marker).length) continue;
+    const dayBg = marker.day_background_image || marker.background_day_image || marker.background_image || '';
+    const nightBg = marker.night_background_image || marker.background_night_image || dayBg;
+    const selected = (forceDay || isDayPhaseNow()) ? dayBg : (nightBg || dayBg);
+    if (selected) return selected;
+  }
+  return '';
+}
+
+function locationIconFor(key, fallback = '❔', aliases = []) {
+  const keys = [key].concat(Array.isArray(aliases) ? aliases : [aliases]).filter(Boolean);
+  for (const locKey of keys) {
+    const marker = locationMarkerConfig(locKey);
+    if (marker?.icon) return marker.icon;
+  }
+  return fallback;
+}
+
+function marketBackgroundForNow() {
+  if (!state?.market_status?.is_open) return 'assets/market/closed.png';
+  const marker = locationMarkerConfig('market');
+  const dayBg = marker.day_background_image || marker.background_day_image || marker.background_image || '';
+  const nightBg = marker.night_background_image || marker.background_night_image || dayBg;
+  const phase = state?.market_status?.phase || (isDayPhaseNow() ? 'day' : 'night');
+  return phase === 'night' ? (nightBg || dayBg) : dayBg;
+}
+
+
+function marketWandererCount() {
+  return Math.max(0, Math.min(10, Number(state?.ui_config?.fae_market_wanderer_count ?? 5)));
+}
+
+function marketWandererImageCount() {
+  return Math.max(1, Math.min(40, Number(state?.ui_config?.fae_market_wanderer_image_count ?? 18)));
+}
+
+function marketWandererSizeScale() {
+  return Math.max(.5, Math.min(2.5, Number(state?.ui_config?.fae_market_wanderer_size ?? 1.18)));
+}
+
+function marketWandererBaseAlpha() {
+  return Math.max(.15, Math.min(1, Number(state?.ui_config?.fae_market_wanderer_alpha ?? .84)));
+}
+
+function marketWandererHueShiftEnabled() {
+  return Number(state?.ui_config?.fae_market_wanderer_hue_shift_enabled ?? 1) === 1 || state?.ui_config?.fae_market_wanderer_hue_shift_enabled === true;
+}
+
+function randomMarketWandererIcon(imageCount = marketWandererImageCount()) {
+  return `assets/market/fae/fae${1 + Math.floor(Math.random() * imageCount)}.png`;
+}
+
+function resetMarketWanderer(f, imageCount = marketWandererImageCount()) {
+  const w = canvasLogicalWidth(), h = canvasLogicalHeight();
+  const scale = marketWandererSizeScale();
+  f.icon = randomMarketWandererIcon(imageCount);
+  f.mode = 'enter';
+  f.x = 80 + Math.random() * Math.max(1, w - 160);
+  f.y = h + 70 + Math.random() * 90;
+  f.targetY = 135 + Math.random() * Math.max(1, h - 255);
+  f.vx = (Math.random() - .5) * .28;
+  f.vy = -(.42 + Math.random() * .28);
+  f.size = (48 + Math.random() * 34) * scale;
+  f.hue = Math.floor(Math.random() * 360);
+  f.alpha = marketWandererBaseAlpha();
+  f.flip = Math.random() < .5 ? -1 : 1;
+  f.nextTurnAt = performance.now() + 900 + Math.random() * 2600;
+  f.recycleAt = performance.now() + 28000 + Math.random() * 42000;
+}
+
+function beginMarketWandererExit(f) {
+  const now = performance.now();
+  f.mode = 'exit';
+  f.exitStartedAt = now;
+  f.vx = (Math.random() - .5) * .18;
+  f.vy = .52 + Math.random() * .34;
+  f.recycleAt = now + 3000;
+}
+
+function ensureMarketWanderers() {
+  const count = marketWandererCount();
+  const imageCount = marketWandererImageCount();
+  const seed = `${count}:${imageCount}:${marketWandererSizeScale()}:${marketWandererBaseAlpha()}:${marketWandererHueShiftEnabled()}:${state?.clock?.absolute_day || 0}:${state?.market_status?.phase || 'day'}:${state?.market_status?.is_open ? 'open' : 'closed'}`;
+  if (marketWandererSeed === seed && marketWanderers.length === count) return;
+  marketWandererSeed = seed;
+  marketWanderers = [];
+  for (let i = 0; i < count; i++) {
+    const f = {};
+    resetMarketWanderer(f, imageCount);
+    f.y = f.targetY + (Math.random() - .5) * 80;
+    f.mode = 'wander';
+    marketWanderers.push(f);
+  }
+}
+
+function drawMarketWanderers() {
+  if (!state?.market_status?.is_open) return;
+  ensureMarketWanderers();
+  const now = performance.now();
+  const w = canvasLogicalWidth(), h = canvasLogicalHeight();
+  const imageCount = marketWandererImageCount();
+  const baseAlpha = marketWandererBaseAlpha();
+  for (const f of marketWanderers) {
+    if (f.mode === 'enter') {
+      f.x += f.vx * 2.2;
+      f.y += f.vy * 2.2;
+      if (f.y <= f.targetY) {
+        f.mode = 'wander';
+        f.vy = (Math.random() - .5) * .28;
+        f.vx = (Math.random() - .5) * .34;
+        f.recycleAt = now + 26000 + Math.random() * 42000;
+      }
+    } else if (f.mode === 'exit') {
+      f.x += f.vx * 2.2;
+      f.y += f.vy * 2.2;
+      if (f.y > h + 120 || now > f.recycleAt) resetMarketWanderer(f, imageCount);
+    } else {
+      f.x += f.vx * 2.2;
+      f.y += f.vy * 2.2;
+      if (now > f.recycleAt) beginMarketWandererExit(f);
+      if (now > f.nextTurnAt) {
+        f.vx = (Math.random() - .5) * .34;
+        f.vy = (Math.random() - .5) * .34;
+        f.nextTurnAt = now + 900 + Math.random() * 2800;
+      }
+      if (f.x < 45 || f.x > w - 45) f.vx *= -1;
+      if (f.y < 95 || f.y > h - 85) f.vy *= -1;
+      f.x = Math.max(45, Math.min(w - 45, f.x));
+      f.y = Math.max(95, Math.min(h - 85, f.y));
+    }
+    const enterFade = f.mode === 'enter' ? Math.max(0, Math.min(1, (h + 80 - f.y) / 120)) : 1;
+    const exitFade = f.mode === 'exit' ? Math.max(0, Math.min(1, 1 - ((f.y - h + 15) / 120))) : 1;
+    ctx.save();
+    ctx.globalAlpha = baseAlpha * enterFade * exitFade;
+    ctx.filter = marketWandererHueShiftEnabled() ? `hue-rotate(${f.hue || 0}deg)` : 'none';
+    ctx.translate(f.x, f.y);
+    ctx.scale(f.flip || 1, 1);
+    drawIcon(f.icon, 0, 0, f.size);
+    ctx.restore();
+  }
+}
+
+function drawMarketBuyablesCanvas() {
+  const items = state?.market_inventory || [];
+  const isOpen = !!state?.market_status?.is_open;
+  const x0 = 72, y0 = 104;
+  ctx.save();
+  ctx.textAlign = 'left';
+  ctx.font = '900 22px system-ui';
+  ctx.fillStyle = '#ffe6a0';
+  ctx.fillText('Market Finds', x0, y0 - 22);
+  if (!isOpen) {
+    ctx.font = '700 16px system-ui';
+    ctx.fillStyle = '#f5d1a0';
+    ctx.fillText('The Fae Market stalls are closed right now.', x0, y0 + 12);
+    ctx.restore();
+    return;
+  }
+  if (!items.length) {
+    ctx.font = '700 16px system-ui';
+    ctx.fillStyle = '#f5d1a0';
+    ctx.fillText('No market finds are available right now.', x0, y0 + 12);
+    ctx.restore();
+    return;
+  }
+  const cols = 3, cardW = 168, cardH = 126, gap = 18;
+  items.slice(0, 9).forEach((item, index) => {
+    const col = index % cols;
+    const row = Math.floor(index / cols);
+    const x = x0 + col * (cardW + gap);
+    const y = y0 + row * (cardH + gap);
+    const qty = Number(item.bundle_quantity || 1);
+    const price = Number(item.market_price || item.base_buy_price || 0);
+    const affordable = Number(state?.user?.coins || 0) >= price;
+    drawCanvasSlot(x, y, cardW, cardH, { fill: 'rgba(22,17,12,.76)', stroke: affordable ? 'rgba(255,230,160,.26)' : 'rgba(255,120,100,.22)' });
+    drawIcon(item.icon || '✨', x + 46, y + 46, 58);
+    if (qty > 1) {
+      ctx.font = '900 17px system-ui';
+      ctx.fillStyle = '#fff8dd';
+      ctx.textAlign = 'center';
+      ctx.fillText(`×${qty}`, x + 82, y + 28);
+    }
+    ctx.font = '800 14px system-ui';
+    ctx.fillStyle = '#f5ead8';
+    ctx.textAlign = 'left';
+    wrapCanvasText(item.name || 'Market Item', x + 18, y + 90, cardW - 36, 16);
+    ctx.font = '900 14px system-ui';
+    ctx.fillStyle = affordable ? '#ffe6a0' : '#ff9c8b';
+    ctx.textAlign = 'right';
+    ctx.fillText(String(price), x + cardW - 18, y + cardH - 18);
+    drawIcon(coinIcon(), x + cardW - 47, y + cardH - 22, 17);
+    canvasSceneHits.push({
+      id: `market-buy:${item.market_inventory_id || item.fae_market_inventory_id || index}`,
+      x, y, w: cardW, h: cardH,
+      tooltip: `<b>${escapeHtml(item.name || 'Market Item')}</b><br><span class="muted-line">Buy ×${qty} for ${moneyHtml(price)}</span>${affordable ? '' : '<br><span style="color:#ff8778">Not enough coins</span>'}`,
+      action: affordable ? () => buyMarketItemLocal(item, x + cardW / 2, y + cardH / 2) : null
+    });
+  });
+  ctx.restore();
+}
+
+function drawMarketScene() {
   canvasSceneHits = [];
-  drawPanelBackground(icon);
-  ctx.fillStyle = '#b8a88f';
-  ctx.font = '24px system-ui';
-  ctx.textAlign = 'center';
-  ctx.fillText(label, canvasLogicalWidth() / 2, canvasLogicalHeight() / 2 + 42);
+  const bg = marketBackgroundForNow();
+  const icon = locationMarkerConfig('market').icon || '🎪';
+  drawPanelBackground(icon, bg);
+  if (state?.market_status?.is_open) drawMarketWanderers();
+  drawMarketBuyablesCanvas();
+}
+
+function drawSimpleScene(label, icon, backgroundImage = '', locationKey = '') {
+  canvasSceneHits = [];
+  const bg = backgroundImage || (locationKey ? locationBackgroundForNow(locationKey) : '');
+  drawPanelBackground(icon, bg);
 }
 
 function drawGardenCanvas() {
   tileRects = [];
+  cropProblemHits = [];
   const visibleKeys = visiblePlotKeys();
   const visiblePlots = (state.plots || []).filter(p => visibleKeys.has(`${Number(p.x_pos)},${Number(p.y_pos)}`));
   if (!visiblePlots.length) return;
@@ -2349,7 +3062,9 @@ function drawGardenCanvas() {
   const size = Math.floor((usable - gap * (Math.max(cols, rows) - 1)) / Math.max(cols, rows));
   const startX = Math.floor((canvasLogicalWidth() - (size * cols + gap * (cols - 1))) / 2);
   const startY = Math.floor((canvasLogicalHeight() - (size * rows + gap * (rows - 1))) / 2);
-  drawPanelBackground('assets/map/garden.png');
+  const gardenMarker = locationMarkerConfig('garden');
+  const gardenBg = gardenBackgroundForNow();
+  drawPanelBackground(gardenMarker.icon || state?.garden?.garden_type_icon || '🌱', gardenBg);
 
   for (const plot of visiblePlots) {
     const gridX = Number(plot.x_pos), gridY = Number(plot.y_pos);
@@ -2401,10 +3116,10 @@ function draw() {
   else if (tab === 'inventory') drawInventoryCanvas();
   else if (tab === 'shed') drawShedCanvas();
   else if (tab === 'helpers') drawHelpersCanvas();
-  else if (tab === 'market') drawSimpleScene('Farmer\'s Market', '🎪');
-  else if (tab === 'caravan') drawSimpleScene('Caravan Camp', '🔮');
-  else if (tab === 'bone_brine') drawSimpleScene('Bone & Brine', '☠️');
-  else if (tab === 'admin') drawSimpleScene('Admin Debug', '🛠️');
+  else if (tab === 'market') drawMarketScene();
+  else if (tab === 'caravan') drawSimpleScene('Caravan Camp', locationIconFor('caravan', '🔮', ['caravan_camp']), locationBackgroundForNow('caravan', ['caravan_camp']), 'caravan');
+  else if (tab === 'bone_brine') drawSimpleScene('Bone & Brine', locationIconFor('bone_brine', '☠️'), locationBackgroundForNow('bone_brine'), 'bone_brine');
+  else if (tab === 'admin') drawSimpleScene('Admin Debug', locationIconFor('admin', '🛠️'), locationBackgroundForNow('admin'), 'admin');
   else drawGardenCanvas();
 
   if (helperAccessoryDrag && pointerCanvasPos && currentTabName() === 'helpers') {
@@ -2538,8 +3253,8 @@ function renderOrders(selectedOrderId = null) {
       if (card) card.classList.add('is-leaving-left');
       setTimeout(() => {
         acceptOrderLocally(id);
-        closeOrdersModal();
         render();
+        openOrdersModal(id);
       }, card ? 140 : 0);
       const data = await doAction({ action: 'accept_order', player_order_id: id }, null, { silent: true });
       if (!data?.ok) fetchState();
@@ -2760,8 +3475,9 @@ function maybeOpenStoryEvent() {
   openDatabaseStoryEvent(event);
 }
 
-function renderClock() {
-  if (!localClockBase) return;
+
+function gameClockSnapshot() {
+  if (!localClockBase) return null;
   const elapsed = (performance.now() - localClockBase.receivedAt) / (localClockBase.dayLength * 1000);
   const totalDayFloat = (localClockBase.absoluteDay - 1) + localClockBase.progress + elapsed;
   const absoluteDay = Math.floor(totalDayFloat) + 1;
@@ -2772,12 +3488,87 @@ function renderClock() {
   const halfHour = Math.floor(progress * 48) / 48;
   const minutes = Math.floor(halfHour * 1440);
   const hour = Math.floor(minutes / 60), minute = minutes % 60;
-  setTextIfExists('#dayLabel', `Year ${year}, Day ${day} · ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`);
+  const weekIndex = (absoluteDay - 1) % 7;
+  return { absoluteDay, year, day, progress, hour, minute, weekIndex };
+}
+
+const HUMAN_WEEK_DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const FAE_WEEK_DAYS = ['Day of Mists', 'Day of Roots', 'Day of Bells', 'Day of Lanterns', 'Day of Stones', 'Day of Moonwater', 'Day of Leaves'];
+
+function calendarLabelForIndex(index) {
+  const human = HUMAN_WEEK_DAYS[index] || 'Day';
+  if (!hasUnlockKey('location_market')) return human;
+  return `${human} · ${FAE_WEEK_DAYS[index] || 'Fae Day'}`;
+}
+
+function bindCalendarClick() {
+  const label = $('#dayLabel');
+  const orb = $('#dayOrb');
+  [label, orb].forEach(el => {
+    if (!el || el.dataset.calendarBound === '1') return;
+    el.dataset.calendarBound = '1';
+    el.classList.add('calendar-click-target');
+    el.addEventListener('click', openCalendarModal);
+  });
+}
+
+function openCalendarModal() {
+  const snap = gameClockSnapshot();
+  if (!snap) return;
+  const existing = $('#calendarModal');
+  const modal = existing || document.createElement('div');
+  if (!existing) {
+    modal.id = 'calendarModal';
+    modal.className = 'modal closeableModal';
+    modal.innerHTML = `<div class="modal-content modal-content--calendar"><div class="modal-header"><h2>${renderIcon(calendarIcon(), 'modal-title-icon')} Calendar</h2><button type="button" class="modal-close" data-close-modal>×</button></div><div id="calendarContent"></div></div>`;
+    document.body.appendChild(modal);
+    modal.querySelector('[data-close-modal]')?.addEventListener('click', () => closeCalendarModal());
+    modal.addEventListener('click', (event) => { if (event.target === modal) closeCalendarModal(); });
+  }
+  const content = modal.querySelector('#calendarContent');
+  const unlocked = hasUnlockKey('location_market');
+  content.innerHTML = `
+    <p class="hint">Year ${snap.year}, Day ${snap.day} · ${calendarLabelForIndex(snap.weekIndex)} · ${String(snap.hour).padStart(2, '0')}:${String(snap.minute).padStart(2, '0')}</p>
+    <div class="calendar-grid ${unlocked ? 'has-fae-days' : ''}">
+      ${HUMAN_WEEK_DAYS.map((day, index) => `
+        <div class="calendar-day ${index === snap.weekIndex ? 'is-today' : ''}">
+          <b>${escapeHtml(day)}</b>
+          ${unlocked ? `<span>${escapeHtml(FAE_WEEK_DAYS[index])}</span>` : ''}
+        </div>
+      `).join('')}
+    </div>
+    ${unlocked ? '<p class="hint">The Fae Market runs from Saturday at 6:00 through Sunday at 18:00.</p>' : '<p class="hint">More calendar notes may appear as the town trusts you with stranger schedules.</p>'}
+  `;
+  modal.classList.add('is-open');
+  document.body.classList.add('modal-open');
+}
+
+
+function closeCalendarModal() {
+  const modal = $('#calendarModal');
+  if (modal) modal.classList.remove('is-open');
+  if (!$('#ordersModal')?.classList.contains('is-open') && !$('#storyModal')?.classList.contains('is-open')) {
+    document.body.classList.remove('modal-open');
+  }
+  hideTooltip();
+}
+
+function renderClock() {
+  const snap = gameClockSnapshot();
+  if (!snap) return;
+  const dayLabel = $('#dayLabel');
+  if (dayLabel) {
+    dayLabel.innerHTML = `${renderIcon(calendarIcon(), 'calendar-label-icon')} Year ${escapeHtml(snap.year)}, Day ${escapeHtml(snap.day)} · ${escapeHtml(calendarLabelForIndex(snap.weekIndex))} · ${escapeHtml(String(snap.hour).padStart(2, '0'))}:${escapeHtml(String(snap.minute).padStart(2, '0'))}`;
+  }
   const orb = $('#dayOrb');
   if (orb) {
-    orb.style.left = `${progress * 100}%`;
-    setIconHtml(orb, (hour >= 6 && hour < 18) ? localClockBase.sunIcon : localClockBase.moonIcon, 'day-orb-icon');
+    orb.style.left = `${snap.progress * 100}%`;
+    setIconHtml(orb, (snap.hour >= 6 && snap.hour < 18) ? localClockBase.sunIcon : localClockBase.moonIcon, 'day-orb-icon');
+    bindTooltip(orb, '<b>Calendar</b><br><span class="muted-line">Open the week calendar.</span>');
   }
+  const label = $('#dayLabel');
+  if (label) bindTooltip(label, '<b>Calendar</b><br><span class="muted-line">Open the week calendar.</span>');
+  bindCalendarClick();
 }
 
 function renderTools() {
@@ -2796,7 +3587,7 @@ function renderTools() {
   const harvest = document.createElement('button');
   harvest.type = 'button';
   harvest.className = `icon-card ${selectedMode.type === 'harvest' ? 'selected' : ''}`;
-  harvest.innerHTML = renderIcon('🧺', 'big-icon');
+  harvest.innerHTML = renderIcon(harvestToolIcon(), 'big-icon');
   bindTooltip(harvest, '<b>Harvest</b><br><span class="muted-line">Harvest ready crops</span>');
   harvest.addEventListener('click', () => { selectedMode = { type: 'harvest', value: 'harvest' }; render(); });
   grid.appendChild(harvest);
@@ -2804,7 +3595,7 @@ function renderTools() {
   const info = document.createElement('button');
   info.type = 'button';
   info.className = `icon-card ${selectedMode.type === 'info' ? 'selected' : ''}`;
-  info.innerHTML = renderIcon('🔎', 'big-icon');
+  info.innerHTML = renderIcon(inspectToolIcon(), 'big-icon');
   bindTooltip(info, '<b>Inspect</b><br><span class="muted-line">Show crop and plot details.</span>');
   info.addEventListener('click', () => { selectedMode = { type: 'info', value: 'info' }; render(); });
   grid.appendChild(info);
@@ -2821,13 +3612,78 @@ function renderSeeds() {
     btn.className = `icon-card ${selectedMode.type === 'seed' && Number(selectedMode.value) === Number(plant.plant_id) ? 'selected' : ''}`;
     btn.disabled = owned <= 0;
     btn.innerHTML = `${renderIcon(plant.seed_icon, 'big-icon')}<b class="qty-badge">×${owned}</b>`;
-    bindTooltip(btn, `<b>${escapeHtml(plant.name)}</b><br><span class="muted-line">${plant.width}×${plant.height}</span><br><span class="muted-line">Owned ×${owned}</span>`);
+    const allowed = plant.allowed_garden_type_names || plant.allowed_garden_types_label || plant.allowed_garden_type_code || '';
+    bindTooltip(btn, `<b>${escapeHtml(plant.name)}</b><br><span class="muted-line">${plant.width}×${plant.height}</span><br><span class="muted-line">Owned ×${owned}</span>${allowed ? `<br><span class="muted-line">Garden: ${escapeHtml(allowed)}</span>` : ''}`);
     btn.addEventListener('click', () => { selectedMode = { type: 'seed', value: Number(plant.plant_id) }; render(); });
     grid.appendChild(btn);
   }
 }
 
+function addInventoryLocal(itemId, quantity, itemData = {}) {
+  const id = Number(itemId || itemData.item_id || 0);
+  const qty = Number(quantity || 1);
+  if (!id || qty <= 0) return;
+  const existing = (state.inventory || []).find(i => Number(i.item_id) === id);
+  if (existing) existing.quantity = Number(existing.quantity || 0) + qty;
+  else {
+    if (!Array.isArray(state.inventory)) state.inventory = [];
+    state.inventory.push({
+      item_id: id,
+      code: itemData.code || '',
+      name: itemData.name || 'Item',
+      item_type: itemData.item_type || 'seed',
+      icon: itemData.icon || '🌱',
+      quantity: qty,
+      base_sell_price: Number(itemData.base_sell_price || 0),
+      base_buy_price: Number(itemData.base_buy_price || 0),
+      shop_row_icon: itemData.shop_row_icon || ''
+    });
+  }
+}
+
+function buyMarketItemLocal(item, fxX = canvasLogicalWidth() / 2, fxY = canvasLogicalHeight() / 2) {
+  const qty = Number(item.bundle_quantity || 1);
+  const price = Number(item.market_price || item.base_buy_price || 0);
+  if (!state?.market_status?.is_open) return showStatus('The Fae Market is not open right now.', true);
+  if (Number(state.user.coins || 0) < price) return showStatus('Not enough coins.', true);
+  state.user.coins = Number(state.user.coins || 0) - price;
+  addInventoryLocal(item.item_id, qty, item);
+  canvasFloatFx.push({ icon: item.icon || '✨', text: `+${qty}`, x: fxX, y: fxY, createdAt: performance.now() });
+  addDomFloat('#coinCount', `-${moneyText(price)}`);
+  render();
+  doAction({ action: 'market_buy_item', market_inventory_id: Number(item.market_inventory_id || item.fae_market_inventory_id || 0) }, null, { silent: true });
+}
+
+function renderMarket() {
+  const sells = $('#marketSellList') || $('#sellList');
+  if (!sells || currentTabName() !== 'market') return;
+  sells.innerHTML = '';
+  const isOpen = !!state?.market_status?.is_open;
+  if (!isOpen) { sells.innerHTML = '<p class="hint">The Fae Market is not open right now.</p>'; return; }
+  const sellable = (state.inventory || []).filter(item => !['system','helper_equipment','relic'].includes(item.item_type) && Number(item.base_sell_price) > 0 && Number(item.quantity) > 0);
+  const title = document.createElement('h4');
+  title.textContent = 'Sell to the Market';
+  sells.appendChild(title);
+  if (!sellable.length) { sells.insertAdjacentHTML('beforeend', '<p class="hint">Nothing sellable in your backpack right now.</p>'); return; }
+  for (const item of sellable) {
+    const row = document.createElement('div');
+    row.className = 'shop-row';
+    row.innerHTML = `<div class="shop-main"><span class="sell-icon-wrap">${renderIcon(item.icon, 'shop-icon')}<b class="sell-qty-badge">×${item.quantity}</b></span><span>${escapeHtml(item.name)}</span></div><button type="button">Sell ${moneyHtml(item.base_sell_price)}</button>`;
+    row.querySelector('button').addEventListener('click', () => {
+      if (Number(item.quantity) <= 0) return;
+      item.quantity = Number(item.quantity) - 1;
+      state.user.coins = Number(state.user.coins) + Number(item.base_sell_price);
+      state.inventory = state.inventory.filter(i => Number(i.quantity) > 0);
+      addDomFloat('#coinCount', `+${moneyText(item.base_sell_price)}`);
+      render();
+      doAction({ action: 'sell_item', item_id: Number(item.item_id), quantity: 1, sale_context: 'market' }, null, { silent: true });
+    });
+    sells.appendChild(row);
+  }
+}
+
 function renderShop() {
+  if (currentTabName() !== 'shop') return;
   const sells = $('#sellList');
   if (!sells) return;
   sells.innerHTML = '';
@@ -2840,10 +3696,12 @@ function renderShop() {
   }
   for (const item of sellable) {
     const row = document.createElement('div');
-    row.className = 'shop-row';
+    row.className = 'shop-row shop-row--sell has-row-bg';
     const limit = limitByItem[String(item.item_id)] || {};
+    const rowIcon = limit.shop_row_icon || item.shop_row_icon || item.icon || '';
+    if (rowIcon) row.style.setProperty('--shop-row-bg', cssImageUrl(rowIcon));
     const remaining = Math.max(0, Number(limit.remaining_quantity || 0));
-    row.innerHTML = `<div class="shop-main"><span class="sell-icon-wrap">${renderIcon(item.icon, 'shop-icon')}<b class="sell-qty-badge">×${item.quantity}</b></span><span>${escapeHtml(item.name)} <small class="muted-line">Shop wants ${remaining} more today</small></span></div><button type="button">Sell ${moneyHtml(item.base_sell_price)}</button>`;
+    row.innerHTML = `<div class="shop-main"><span class="sell-icon-wrap">${renderIcon(item.icon, 'shop-icon')}<b class="sell-qty-badge">×${item.quantity}</b></span><span>${escapeHtml(item.name)} <small class="muted-line">Limit: ${remaining}</small></span></div><button type="button">Sell ${moneyHtml(item.base_sell_price)}</button>`;
     row.querySelector('button').addEventListener('click', () => {
       if (Number(item.quantity) <= 0) return;
       item.quantity = Number(item.quantity) - 1;
@@ -2897,7 +3755,7 @@ function secondsUntilGameHour(targetHour) {
 
 function getLocalMarketStatus() {
   if (state?.market_status) return state.market_status;
-  return { is_open: false, label: 'Market opens', seconds_remaining: secondsUntilGameHour(7) };
+  return { is_open: false, label: 'Fae Market opens', seconds_remaining: secondsUntilGameHour(6), phase: 'day' };
 }
 
 function getMapEventTimersHtml() {
@@ -2909,7 +3767,12 @@ function getMapEventTimersHtml() {
   if (marketUnlocked) {
     html += `<div class="side-timer-row"><span>${escapeHtml(marketStatus.label || 'Market opens')}</span><b data-map-timer="market">${formatSeconds(Math.max(0, Number(marketStatus.seconds_remaining || 0)))}</b></div>`;
   }
-  html += '<div class="side-timer-row muted"><span>Caravan</span><b>Not scheduled</b></div>';
+  const caravanStatus = state?.caravan_status || null;
+  if (caravanStatus) {
+    html += `<div class="side-timer-row"><span>${escapeHtml(caravanStatus.label || 'Caravan arrives')}</span><b data-map-timer="caravan">${formatSeconds(Math.max(0, Number(caravanStatus.seconds_remaining || 0)))}</b></div>`;
+  } else {
+    html += '<div class="side-timer-row muted"><span>Caravan</span><b>Not scheduled</b></div>';
+  }
   html += '</div>';
   return html;
 }
@@ -2924,6 +3787,8 @@ function updateMapSideTimers() {
   if (shop) shop.textContent = formatSeconds(Math.max(0, Number(state?.shop_refresh?.seconds_remaining || secondsUntilGameHour(7))));
   const market = document.querySelector('[data-map-timer="market"]');
   if (market) market.textContent = formatSeconds(Math.max(0, Number(state?.market_status?.seconds_remaining || 0)));
+  const caravan = document.querySelector('[data-map-timer="caravan"]');
+  if (caravan) caravan.textContent = formatSeconds(Math.max(0, Number(state?.caravan_status?.seconds_remaining || 0)));
 }
 
 
@@ -3008,9 +3873,32 @@ function updateOrdersBoardTimers() {
   });
 }
 
+
+function orderInventorySummaryHtml() {
+  const items = (state?.inventory || []).filter(i => ['seed','produce'].includes(i.item_type));
+  if (!items.length) return '<p class="hint">Backpack: no seeds or crops right now.</p>';
+  const rows = items.map(item => `<div class="order-side-inv-row">${renderIcon(item.icon || '✦', 'side-inv-icon')}<span>${escapeHtml(item.name || item.code || 'Item')}</span><b>×${Number(item.quantity || 0)}</b></div>`).join('');
+  return `<div class="order-side-inventory"><h4>Backpack Seeds & Crops</h4>${rows}</div>`;
+}
+
+function syncOrdersBoardBackground(surface) {
+  if (!surface) return;
+  const bg = locationBackgroundForNow('orders');
+  const icon = ordersIcon();
+  surface.style.setProperty('--orders-board-bg', bg && isImageIcon(bg) ? cssImageUrl(bg) : 'none');
+  surface.style.setProperty('--orders-board-icon', 'none');
+  const dom = surface.querySelector('.orders-board-dom');
+  if (dom) {
+    dom.classList.toggle('has-bg-image', !!bg && isImageIcon(bg));
+  }
+  const iconEl = surface.querySelector('.orders-board-dom-icon');
+  if (iconEl) iconEl.innerHTML = renderIcon(icon, 'orders-board-title-icon');
+}
+
 function renderOrdersBoardList() {
   const sideList = $('#ordersBoardList');
   const surface = $('#ordersBoardSurface');
+  syncOrdersBoardBackground(surface);
   const confirmedOrders = state?.orders || [];
   const availableOrders = state?.available_orders || [];
   const confirmed = confirmedOrders.length;
@@ -3020,7 +3908,7 @@ function renderOrdersBoardList() {
 
   if (sideList) {
     const side = state?.map_config?.side_menus?.orders || state?.map_config?.side_menu_orders || ORDER_SIDEBAR_COPY;
-    sideList.innerHTML = `${side}<p class="hint"><b>Confirmed:</b> ${confirmed}/${limit} · <b>Available:</b> ${available}/${availableLimit}</p>`;
+    sideList.innerHTML = `${side}<p class="hint"><b>Confirmed:</b> ${confirmed}/${limit} · <b>Available:</b> ${available}/${availableLimit}</p>${orderInventorySummaryHtml()}`;
   }
 
   if (!surface) return;
@@ -3044,7 +3932,7 @@ function renderOrdersBoardList() {
   surface.innerHTML = `
     <div class="orders-board-dom">
       <div class="orders-board-dom-header">
-        <div class="orders-board-dom-icon">📜</div>
+        <div class="orders-board-dom-icon">${renderIcon(ordersIcon(), 'orders-board-title-icon')}</div>
         <h2>Orders Board</h2>
         <p>Confirmed Orders: ${confirmed}/${limit} · Available Orders: ${available}/${availableLimit}</p>
       </div>
@@ -3058,50 +3946,41 @@ function renderOrdersBoardList() {
       </section>
     </div>
   `;
+  syncOrdersBoardBackground(surface);
   bindOrderBoardClicks(surface);
+}
+
+function helperSummonInventoryItems() {
+  return (state?.inventory || []).filter(item => Number(item.quantity || 0) > 0 && ['fairy_bell'].includes(item.code));
 }
 
 function renderWorkers() {
   const hint = $('#helperUnlockHint'), workerList = $('#workerList'), plantOrderList = $('#plantOrderList');
-  if (hint) hint.textContent = hasUnlockKey('helpers_unlocked') ? 'Equip an accessory to assign a Forest Folk job.' : 'Find a relic, meet Madam Rune, and ring the first fairy bell.';
+  if (hint) hint.textContent = hasUnlockKey('helpers_unlocked')
+    ? 'Helper accessories are assigned directly on the Forest Folk canvas.'
+    : 'Find a relic, meet Madam Rune, and ring the first fairy bell.';
   if (workerList) {
+    const summons = helperSummonInventoryItems();
     workerList.innerHTML = '';
-    const helpers = state.helpers || [];
-    const accessories = state.helper_accessories || [];
-    if (!helpers.length) workerList.innerHTML = '<p class="hint">No forest folk have joined yet.</p>';
-    for (const helper of helpers) {
-      const row = document.createElement('div');
-      row.className = 'shop-row helper-row forest-helper-row';
-      const options = ['<option value="0">No accessory — Idle</option>'].concat(accessories.map(acc => {
-        const owned = Number(acc.owned_quantity ?? (acc.code === 'aqua_amulet' ? 1 : 0));
-        const equippedElsewhere = Number(acc.equipped_count || 0) > 0 && Number(helper.equipped_helper_equipment_id || 0) !== Number(acc.helper_equipment_id || 0);
-        const disabled = owned < 1 || equippedElsewhere;
-        const selected = Number(helper.equipped_helper_equipment_id || 0) === Number(acc.helper_equipment_id || 0);
-        return `<option value="${Number(acc.helper_equipment_id)}" ${selected ? 'selected' : ''} ${disabled ? 'disabled' : ''}>${escapeHtml(acc.icon || acc.item_icon || '✨')} ${escapeHtml(acc.name)} → ${escapeHtml(acc.task_type)}${disabled ? ' (unavailable)' : ''}</option>`;
-      })).join('');
-      row.innerHTML = `<div class="helper-main"><span class="helper-icon">${renderIcon(helper.icon || '🧚', 'helper-inline-icon')}</span><span><b>${escapeHtml(helper.helper_name || 'Unnamed Helper')}</b><br><small class="muted-line">${escapeHtml(helper.name || helper.species_key || 'Forest Folk')} · ${escapeHtml(helper.active_task || 'idle')}</small><br><small class="muted-line">Speed ${escapeHtml(helper.speed_rating || 10)} · Effectiveness ${escapeHtml(helper.effectiveness_rating || 10)}</small></span></div><select class="helper-accessory-select" data-helper-equip="${Number(helper.player_helper_id)}">${options}</select>`;
-      workerList.appendChild(row);
-    }
-    workerList.querySelectorAll('[data-helper-equip]').forEach(sel => {
-      if (sel.dataset.bound) return;
-      sel.dataset.bound = '1';
-      sel.addEventListener('change', () => {
-        const helperId = Number(sel.dataset.helperEquip);
-        const equipmentId = Number(sel.value || 0);
-        const helper = (state.helpers || []).find(h => Number(h.player_helper_id) === helperId);
-        const equip = (state.helper_accessories || []).find(a => Number(a.helper_equipment_id) === equipmentId);
-        if (helper) {
-          helper.equipped_helper_equipment_id = equipmentId || null;
-          helper.equipment_name = equip?.name || null;
-          helper.equipment_icon = equip?.icon || null;
-          helper.active_task = equip?.task_type || 'idle';
-        }
-        render();
-        doAction({ action: 'equip_helper_accessory', player_helper_id: helperId, helper_equipment_id: equipmentId || null }, null, { silent: true });
+    if (!summons.length) {
+      workerList.innerHTML = '<p class="hint">No helper summon items are waiting in your pack.</p>';
+    } else {
+      for (const item of summons) {
+        const row = document.createElement('div');
+        row.className = 'shop-row helper-row forest-helper-row';
+        row.innerHTML = `<div class="helper-main"><span class="helper-icon">${renderIcon(item.icon || '🔔', 'helper-inline-icon')}</span><span><b>${escapeHtml(item.name || 'Summon Item')}</b><br><small class="muted-line">Quantity ${escapeHtml(item.quantity || 1)}</small></span></div><button type="button" data-use-helper-summon="${escapeHtml(item.code)}">Use</button>`;
+        workerList.appendChild(row);
+      }
+      workerList.querySelectorAll('[data-use-helper-summon]').forEach(btn => {
+        if (btn.dataset.bound) return;
+        btn.dataset.bound = '1';
+        btn.addEventListener('click', () => {
+          if (btn.dataset.useHelperSummon === 'fairy_bell') openFairyBellModal();
+        });
       });
-    });
+    }
   }
-  if (plantOrderList) plantOrderList.innerHTML = '<p class="hint">Accessory assignment now lives on the Forest Folk canvas so owned accessories can be dragged onto helper slots.</p>'; 
+  if (plantOrderList) plantOrderList.innerHTML = '<p class="hint">Your helpers and accessories now live on the Forest Folk canvas. Drag an owned accessory onto a helper slot to change their job.</p>';
 }
 
 
@@ -3136,6 +4015,12 @@ function render() {
   if (backBtn) { backBtn.innerHTML = `${renderIcon(mapIcon(), 'button-inline-icon')} Map`; backBtn.dataset.tooltipHtml = MAP_TOOLTIP; }
   const sideBackBtn = document.querySelector('[data-side-map-button]');
   if (sideBackBtn) { sideBackBtn.innerHTML = `${renderIcon(mapIcon(), 'button-inline-icon')} Map`; sideBackBtn.dataset.tooltipHtml = MAP_TOOLTIP; }
+  const ordersBtn = $('#ordersBtn');
+  if (ordersBtn) {
+    const currentText = $('#ordersTimer')?.textContent || '0/0';
+    const badgeVisible = $('#ordersBadge')?.classList.contains('visible');
+    ordersBtn.innerHTML = `${renderIcon(ordersIcon(), 'button-inline-icon')} Orders: <span id="ordersTimer">${escapeHtml(currentText)}</span><b id="ordersBadge" class="order-badge ${badgeVisible ? 'visible' : ''}">!</b>`;
+  }
   setTextIfExists('#reputationCount', state.progress?.reputation ?? state.user?.reputation ?? 0);
   setIconHtml($('#reputationIcon'), reputationIcon(), 'header-stat-icon');
   setTextIfExists('#recognitionCount', state.progress?.recognition ?? state.user?.recognition ?? 0);
@@ -3150,6 +4035,7 @@ function render() {
   renderTools();
   renderSeeds();
   renderShop();
+  renderMarket();
   renderShed();
   renderWorkers();
   renderAdmin();
@@ -3183,12 +4069,14 @@ document.addEventListener('click', evt => {
     evt.preventDefault();
     closeOrdersModal();
     closeStoryModal();
+    closeCalendarModal();
     return;
   }
   if (evt.target?.id === 'ordersModal') closeOrdersModal();
+  if (evt.target?.id === 'calendarModal') closeCalendarModal();
 });
 document.addEventListener('keydown', evt => {
-  if (evt.key === 'Escape') closeOrdersModal();
+  if (evt.key === 'Escape') { closeOrdersModal(); closeCalendarModal(); }
 });
 
 
@@ -3212,6 +4100,20 @@ function handleHelperAccessoryMouseUp(evt) {
   else render();
 }
 
+
+function handleCanvasWheel(evt) {
+  if (isModalOpen() || currentTabName() !== 'helpers') return;
+  const helpers = state?.helpers || [];
+  const listH = canvasLogicalHeight() - 300;
+  const cardH = 112, cardGap = 12, cols = 2;
+  const rows = Math.ceil(helpers.length / cols);
+  const contentH = rows * (cardH + cardGap) - cardGap;
+  const maxScroll = Math.max(0, contentH - (listH - 28));
+  if (maxScroll <= 0) return;
+  helperCanvasScroll = Math.max(0, Math.min(maxScroll, helperCanvasScroll + evt.deltaY));
+  evt.preventDefault();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   canvas = $('#gardenCanvas');
   ctx = canvas.getContext('2d');
@@ -3222,6 +4124,7 @@ document.addEventListener('DOMContentLoaded', () => {
   canvas.addEventListener('mousemove', handleCanvasMove);
   canvas.addEventListener('mouseleave', handleCanvasLeave);
   canvas.addEventListener('click', handleCanvasClick);
+  canvas.addEventListener('wheel', handleCanvasWheel, { passive: false });
   canvas.addEventListener('mousedown', handleShedMouseDown);
   canvas.addEventListener('mousedown', handleHelperAccessoryMouseDown);
   canvas.addEventListener('mousedown', startRepeat);
@@ -3274,5 +4177,5 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }, 1000);
   setInterval(runClientHelperAutomation, 1000);
-  setInterval(fetchState, 15000);
+  setInterval(() => { if (savePendingCount === 0) fetchState(); }, 15000);
 });

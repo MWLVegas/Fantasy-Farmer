@@ -20,6 +20,7 @@ DROP TABLE IF EXISTS player_workers;
 DROP TABLE IF EXISTS worker_types;
 DROP TABLE IF EXISTS seed_hybrid_recipes;
 DROP TABLE IF EXISTS player_shop_sales;
+DROP TABLE IF EXISTS fae_market_inventory;
 DROP TABLE IF EXISTS shop_buy_limits;
 DROP TABLE IF EXISTS shop_seed_offers;
 DROP TABLE IF EXISTS player_pouches;
@@ -29,6 +30,7 @@ DROP TABLE IF EXISTS player_tools;
 DROP TABLE IF EXISTS tools;
 DROP TABLE IF EXISTS garden_plots;
 DROP TABLE IF EXISTS gardens;
+DROP TABLE IF EXISTS player_garden_type_unlocks;
 DROP TABLE IF EXISTS garden_types;
 DROP TABLE IF EXISTS player_state;
 DROP TABLE IF EXISTS game_config;
@@ -55,10 +57,9 @@ CREATE TABLE game_config (
   day_start_hour INT NOT NULL DEFAULT 6,
   sun_icon VARCHAR(255) NOT NULL DEFAULT '☀️',
   moon_icon VARCHAR(255) NOT NULL DEFAULT '🌙',
-  goblin_icon VARCHAR(255) NOT NULL DEFAULT '🧌',
   pouch_icon VARCHAR(255) NOT NULL DEFAULT '👝',
   pouch_sprite_sheet VARCHAR(255) DEFAULT NULL,
-  app_version VARCHAR(20) NOT NULL DEFAULT 'v0.4.16g',
+  app_version VARCHAR(20) NOT NULL DEFAULT 'v0.4.35',
   max_available_orders INT NOT NULL DEFAULT 5,
   order_board_min_minutes INT NOT NULL DEFAULT 3,
   order_board_max_minutes INT NOT NULL DEFAULT 8,
@@ -72,10 +73,18 @@ CREATE TABLE game_config (
   order_rush_bonus_percent INT NOT NULL DEFAULT 20,
   map_title VARCHAR(100) NOT NULL DEFAULT 'Town',
   map_background_image VARCHAR(255) DEFAULT NULL,
+  map_day_background_image VARCHAR(255) DEFAULT NULL,
+  map_night_background_image VARCHAR(255) DEFAULT NULL,
   map_button_positions_json TEXT DEFAULT NULL,
   shed_background_image VARCHAR(255) DEFAULT NULL,
   map_side_menu_html MEDIUMTEXT DEFAULT NULL,
-  year_length_days INT NOT NULL DEFAULT 300
+  year_length_days INT NOT NULL DEFAULT 300,
+  fae_market_wanderer_count INT NOT NULL DEFAULT 5,
+  fae_market_wanderer_image_count INT NOT NULL DEFAULT 18,
+  fae_market_wanderer_size DECIMAL(4,2) NOT NULL DEFAULT 1.18,
+  fae_market_wanderer_alpha DECIMAL(4,2) NOT NULL DEFAULT 0.84,
+  fae_market_wanderer_hue_shift_enabled TINYINT(1) NOT NULL DEFAULT 1,
+  locked_plot_icon VARCHAR(255) NOT NULL DEFAULT '🔒'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE map_location_config (
@@ -84,9 +93,17 @@ CREATE TABLE map_location_config (
   map_x INT NOT NULL DEFAULT 0,
   map_y INT NOT NULL DEFAULT 0,
   map_icon VARCHAR(255) NOT NULL,
+  active_map_icon VARCHAR(255) DEFAULT NULL,
+  inactive_map_icon VARCHAR(255) DEFAULT NULL,
   icon_size INT NOT NULL DEFAULT 78,
   glow_color VARCHAR(80) NOT NULL DEFAULT 'rgba(255, 214, 94, .78)',
   side_menu_html MEDIUMTEXT DEFAULT NULL,
+  day_background_image VARCHAR(255) DEFAULT NULL,
+  night_background_image VARCHAR(255) DEFAULT NULL,
+  active_day_background_image VARCHAR(255) DEFAULT NULL,
+  active_night_background_image VARCHAR(255) DEFAULT NULL,
+  inactive_day_background_image VARCHAR(255) DEFAULT NULL,
+  inactive_night_background_image VARCHAR(255) DEFAULT NULL,
   sort_order INT NOT NULL DEFAULT 0,
   is_active TINYINT(1) NOT NULL DEFAULT 1
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -111,6 +128,8 @@ CREATE TABLE items (
   base_buy_price INT NOT NULL DEFAULT 0,
   base_sell_price INT NOT NULL DEFAULT 0,
   icon VARCHAR(255) DEFAULT NULL,
+  shop_row_icon VARCHAR(255) DEFAULT NULL,
+  work_sprite VARCHAR(255) DEFAULT NULL,
   is_active TINYINT(1) NOT NULL DEFAULT 1
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -120,8 +139,22 @@ CREATE TABLE garden_types (
   name VARCHAR(100) NOT NULL,
   description TEXT DEFAULT NULL,
   icon VARCHAR(255) DEFAULT NULL,
+  day_background_image VARCHAR(255) DEFAULT NULL,
+  night_background_image VARCHAR(255) DEFAULT NULL,
+  weed_icons_json JSON DEFAULT NULL,
+  pest_icons_json JSON DEFAULT NULL,
   unlock_cost INT NOT NULL DEFAULT 0,
   is_active TINYINT(1) NOT NULL DEFAULT 1
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE player_garden_type_unlocks (
+  user_id INT NOT NULL,
+  garden_type_id INT NOT NULL,
+  source VARCHAR(80) NOT NULL DEFAULT 'system',
+  unlocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, garden_type_id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+  FOREIGN KEY (garden_type_id) REFERENCES garden_types(garden_type_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE gardens (
@@ -184,6 +217,7 @@ CREATE TABLE plants (
   code VARCHAR(80) NOT NULL UNIQUE,
   name VARCHAR(100) NOT NULL,
   allowed_garden_type_code VARCHAR(50) NOT NULL DEFAULT 'farm',
+  allowed_garden_types_json JSON DEFAULT NULL,
   seed_item_id INT NOT NULL,
   harvest_item_id INT NOT NULL,
   width INT NOT NULL DEFAULT 1,
@@ -198,6 +232,9 @@ CREATE TABLE plants (
   seed_icon VARCHAR(255) DEFAULT NULL,
   stage_icons_json JSON DEFAULT NULL,
   mature_icon VARCHAR(255) DEFAULT NULL,
+  background_image VARCHAR(255) DEFAULT NULL,
+  weed_icons_json JSON DEFAULT NULL,
+  pest_icons_json JSON DEFAULT NULL,
   unlock_cost INT NOT NULL DEFAULT 0,
   is_active TINYINT(1) NOT NULL DEFAULT 1,
   FOREIGN KEY (seed_item_id) REFERENCES items(item_id),
@@ -372,24 +409,29 @@ CREATE TABLE processing_jobs (
   FOREIGN KEY (recipe_id) REFERENCES processing_recipes(recipe_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-INSERT INTO game_config (config_id, day_length_seconds, shop_refresh_minutes, day_start_hour, sun_icon, moon_icon, goblin_icon, pouch_icon, app_version, max_available_orders, order_board_min_minutes, order_board_max_minutes, order_refill_min_minutes, order_refill_max_minutes, order_normal_min_minutes, order_normal_max_minutes, order_rush_min_minutes, order_rush_max_minutes, order_late_fee_percent, order_rush_bonus_percent, map_title, map_background_image, map_button_positions_json, map_side_menu_html, year_length_days)
-VALUES (1, 720, 720, 6, '☀️', '🌙', '🧌', '👝', 'v0.4.16g', 5, 3, 8, 1, 1, 30, 120, 15, 30, 20, 20, 'Town', NULL, '{"orders":[298,105],"helpers":[475,125],"shop":[110,290],"garden":[298,298],"shed":[485,290],"bone_brine":[90,510],"market":[298,500],"caravan":[470,510]}', '<p class="hint">Use the map to travel around town.</p>', 300);
+INSERT INTO game_config (config_id, day_length_seconds, shop_refresh_minutes, day_start_hour, sun_icon, moon_icon, pouch_icon, app_version, max_available_orders, order_board_min_minutes, order_board_max_minutes, order_refill_min_minutes, order_refill_max_minutes, order_normal_min_minutes, order_normal_max_minutes, order_rush_min_minutes, order_rush_max_minutes, order_late_fee_percent, order_rush_bonus_percent, map_title, map_background_image, map_day_background_image, map_night_background_image, map_button_positions_json, map_side_menu_html, year_length_days, fae_market_wanderer_count, fae_market_wanderer_image_count, fae_market_wanderer_size, fae_market_wanderer_alpha, fae_market_wanderer_hue_shift_enabled, locked_plot_icon)
+VALUES (1, 720, 720, 6, '☀️', '🌙', '👝', 'v0.4.35', 5, 3, 8, 1, 1, 30, 120, 15, 30, 20, 20, '', 'assets/map/background.png', 'assets/map/map_day.png', 'assets/map/map_night.png', '{"orders":[298,105],"helpers":[475,125],"shop":[110,290],"garden":[298,298],"shed":[485,290],"bone_brine":[90,510],"market":[298,500],"caravan":[470,510]}', '<p class="hint">Use the map to travel around town.</p>', 300, 5, 18, 1.18, 0.84, 1, '🔒');
 
-INSERT INTO map_location_config (location_key, map_x, map_y, map_icon, icon_size, glow_color, sort_order, is_active) VALUES
-('orders', 298, 105, 'assets/map/orders.png', 82, 'rgba(255, 214, 94, .78)', 10, 1),
-('helpers', 475, 125, 'assets/map/fairy_folk.png', 86, 'rgba(255, 214, 94, .78)', 20, 1),
-('shop', 110, 290, 'assets/map/store.png', 88, 'rgba(255, 214, 94, .78)', 30, 1),
-('garden', 298, 298, 'assets/map/garden.png', 86, 'rgba(255, 214, 94, .78)', 40, 1),
-('shed', 485, 290, 'assets/map/shed.png', 84, 'rgba(255, 214, 94, .78)', 50, 1),
-('bone_brine', 90, 510, 'assets/map/bone_brine.png', 78, 'rgba(255, 214, 94, .78)', 60, 1),
-('market', 298, 500, 'assets/map/market.png', 78, 'rgba(255, 214, 94, .78)', 70, 1),
-('caravan', 470, 510, 'assets/map/caravan_empty.png', 96, 'rgba(255, 214, 94, .78)', 80, 1);
+INSERT INTO map_location_config (location_key, map_x, map_y, map_icon, active_map_icon, inactive_map_icon, icon_size, glow_color, day_background_image, night_background_image, active_day_background_image, active_night_background_image, inactive_day_background_image, inactive_night_background_image, sort_order, is_active) VALUES
+('orders', 298, 105, 'assets/map/orders.png', NULL, NULL, 82, 'rgba(255, 214, 94, .78)', NULL, NULL, NULL, NULL, NULL, NULL, 10, 1),
+('helpers', 475, 125, 'assets/map/fairy_folk.png', NULL, NULL, 86, 'rgba(255, 214, 94, .78)', NULL, NULL, NULL, NULL, NULL, NULL, 20, 1),
+('shop', 110, 290, 'assets/map/store.png', NULL, NULL, 88, 'rgba(255, 214, 94, .78)', NULL, NULL, NULL, NULL, NULL, NULL, 30, 1),
+('garden', 298, 298, 'assets/map/garden.png', NULL, NULL, 86, 'rgba(255, 214, 94, .78)', NULL, NULL, NULL, NULL, NULL, NULL, 40, 1),
+('shed', 485, 290, 'assets/map/shed.png', NULL, NULL, 84, 'rgba(255, 214, 94, .78)', NULL, NULL, NULL, NULL, NULL, NULL, 50, 1),
+('bone_brine', 90, 510, 'assets/map/bone_brine.png', NULL, NULL, 78, 'rgba(255, 214, 94, .78)', NULL, NULL, NULL, NULL, NULL, NULL, 60, 1),
+('market', 298, 500, 'assets/map/market.png', NULL, NULL, 78, 'rgba(255, 214, 94, .78)', NULL, NULL, NULL, NULL, NULL, NULL, 70, 1),
+('caravan', 470, 510, 'assets/map/caravan_empty.png', 'assets/map/caravan_full.png', 'assets/map/caravan_empty.png', 96, 'rgba(255, 214, 94, .78)', 'assets/map/caravan_empty_day.png', 'assets/map/caravan_empty_night.png', 'assets/map/caravan_full_day.png', 'assets/map/caravan_full_night.png', 'assets/map/caravan_empty_day.png', 'assets/map/caravan_empty_night.png', 80, 1);
 
-INSERT INTO garden_types (code, name, description, icon) VALUES
-('farm', 'Farm Garden', 'Good soil for humble beginnings.', '🌱'),
-('water', 'Water Garden', 'Flooded beds for water-loving crops.', '💧'),
-('mountain', 'Mountain Garden', 'Rocky terraces for hardy crops.', '⛰️'),
-('mystic', 'Mystic Garden', 'Strange soil humming with magic.', '✨');
+INSERT INTO garden_types (code, name, description, icon, day_background_image, night_background_image) VALUES
+('farm', 'Farm Garden', 'Good soil for humble beginnings.', '🌱', 'assets/gardens/garden_day_farm.png', 'assets/gardens/garden_night_farm.png'),
+('water', 'Water Garden', 'Flooded beds for water-loving crops.', '💧', 'assets/gardens/garden_day_water.png', 'assets/gardens/garden_night_water.png'),
+('bog', 'Bog Garden', 'Soft, strange ground for marshy crops.', '🪷', 'assets/gardens/garden_day_bog.png', 'assets/gardens/garden_night_bog.png'),
+('forest', 'Forest Garden', 'Leafy shade and old-root soil.', '🌲', 'assets/gardens/garden_day_forest.png', 'assets/gardens/garden_night_forest.png'),
+('cloud', 'Cloud Garden', 'High, misty beds for sky-touched crops.', '☁️', 'assets/gardens/garden_day_cloud.png', 'assets/gardens/garden_night_cloud.png'),
+('embers', 'Ember Garden', 'Warm ash soil for fire-kissed crops.', '🔥', 'assets/gardens/garden_day_embers.png', 'assets/gardens/garden_night_embers.png');
+
+INSERT INTO player_garden_type_unlocks (user_id, garden_type_id, source)
+SELECT user_id, (SELECT garden_type_id FROM garden_types WHERE code='farm'), 'starter' FROM users;
 
 INSERT INTO items (code, name, item_type, base_buy_price, base_sell_price, icon) VALUES
 ('garden_planted_soil', 'Freshly Planted Soil', 'system', 0, 0, 'assets/icons/garden-planted-soil.png'),
@@ -399,7 +441,19 @@ INSERT INTO items (code, name, item_type, base_buy_price, base_sell_price, icon)
 ('nav_map', 'Map Icon', 'system', 0, 0, '🗺️'),
 ('nav_backpack', 'Backpack Icon', 'system', 0, 0, '🎒'),
 ('nav_orders', 'Orders Icon', 'system', 0, 0, '📜'),
+('nav_calendar', 'Calendar Icon', 'system', 0, 0, '📅'),
+('tool_harvest', 'Harvest Tool Cursor Icon', 'system', 0, 0, '🧺'),
+('tool_inspect', 'Inspect Tool Cursor Icon', 'system', 0, 0, '🔎'),
+('fx_water', 'Water Click Effect Icon', 'system', 0, 0, '💧'),
+('fx_till', 'Till Click Effect Icon', 'system', 0, 0, '💢'),
+('fx_plant', 'Plant Click Effect Icon', 'system', 0, 0, '✨'),
+('fx_harvest', 'Harvest Click Effect Icon', 'system', 0, 0, '✦'),
+('fx_dig', 'Dig Click Effect Icon', 'system', 0, 0, '🪨'),
+('fx_pouch', 'Pouch Click Effect Icon', 'system', 0, 0, '💨'),
+('fx_relic', 'Relic Click Effect Icon', 'system', 0, 0, '🔹'),
 ('quest_available', 'Quest Available Icon', 'system', 0, 0, '!'),
+('weed', 'Weed', 'material', 0, 1, '🌿'),
+('farm_bug', 'Farm Bug', 'material', 0, 1, '🐛'),
 ('fairy_bell', 'Fairy Bell', 'material', 0, 0, '🔔'),
 ('aqua_amulet', 'Aqua Amulet', 'helper_equipment', 0, 0, '💧'),
 ('relic_first_oddity', 'Strange Buried Relic', 'relic', 0, 0, '🔹'),
@@ -489,6 +543,21 @@ CREATE TABLE shop_buy_limits (
   daily_limit INT NOT NULL DEFAULT 10,
   is_basic TINYINT(1) NOT NULL DEFAULT 1,
   is_active TINYINT(1) NOT NULL DEFAULT 1,
+  FOREIGN KEY (item_id) REFERENCES items(item_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+
+CREATE TABLE fae_market_inventory (
+  fae_market_inventory_id INT AUTO_INCREMENT PRIMARY KEY,
+  item_id INT NOT NULL,
+  bundle_quantity INT NOT NULL DEFAULT 1,
+  market_price INT DEFAULT NULL,
+  market_phase ENUM('day','night','both') NOT NULL DEFAULT 'both',
+  stock_mode ENUM('infinite','limited') NOT NULL DEFAULT 'infinite',
+  daily_limit INT DEFAULT NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  sort_order INT NOT NULL DEFAULT 0,
+  UNIQUE KEY uniq_item_phase (item_id, market_phase),
   FOREIGN KEY (item_id) REFERENCES items(item_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -653,6 +722,7 @@ CREATE TABLE helper_equipment (
   description TEXT DEFAULT NULL,
   sort_order INT NOT NULL DEFAULT 0,
   accessory_tag VARCHAR(80) NOT NULL DEFAULT 'forest_folk_accessory',
+  work_sprite VARCHAR(255) DEFAULT NULL,
   is_active TINYINT(1) NOT NULL DEFAULT 1
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -688,6 +758,26 @@ CREATE TABLE fertilizer_definitions (
   FOREIGN KEY (item_id) REFERENCES items(item_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE crop_problems (
+  crop_problem_id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  garden_id INT NOT NULL,
+  planted_crop_id INT NOT NULL,
+  problem_type ENUM('weed','pest') NOT NULL,
+  problem_code VARCHAR(80) NOT NULL DEFAULT 'generic',
+  name VARCHAR(100) NOT NULL,
+  icon VARCHAR(255) DEFAULT NULL,
+  reward_item_code VARCHAR(80) NOT NULL,
+  is_resolved TINYINT(1) NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  resolved_at DATETIME DEFAULT NULL,
+  INDEX idx_crop_active (planted_crop_id, is_resolved),
+  INDEX idx_user_garden_active (user_id, garden_id, is_resolved),
+  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+  FOREIGN KEY (garden_id) REFERENCES gardens(garden_id) ON DELETE CASCADE,
+  FOREIGN KEY (planted_crop_id) REFERENCES planted_crops(planted_crop_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE crop_fertilizers (
   crop_fertilizer_id INT AUTO_INCREMENT PRIMARY KEY,
   user_id INT NOT NULL,
@@ -709,13 +799,13 @@ INSERT INTO helper_types (code, species_key, name, icon, description, sort_order
 ('mushling', 'mushling', 'Mushling', '🍄', 'Future soil, fertilizer, and compost specialist scaffold.', 30),
 ('spriggan', 'spriggan', 'Spriggan', '🌿', 'Future weeds and pests specialist scaffold.', 40);
 
-INSERT INTO helper_equipment (code, name, task_type, icon, description, sort_order, accessory_tag) VALUES
-('aqua_amulet', 'Aqua Amulet', 'water', '💧', 'Gives a helper water magic for crop watering.', 10, 'forest_folk_accessory'),
-('root_charm', 'Root Charm', 'till', '🌱', 'Assigns Till work to a helper.', 20, 'forest_folk_accessory'),
-('seed_satchel', 'Seed Satchel', 'plant', '🌰', 'Assigns Plant work to a helper.', 30, 'forest_folk_accessory'),
-('harvest_basket', 'Harvest Basket', 'harvest', '🧺', 'Assigns Harvest work to a helper.', 40, 'forest_folk_accessory'),
-('market_pouch', 'Market Pouch', 'market_sell', '👝', 'Lets a helper carry produce to market.', 80, 'forest_folk_accessory'),
-('order_stamp', 'Order Stamp', 'orders', '📮', 'Lets a helper help with order paperwork.', 90, 'forest_folk_accessory');
+INSERT INTO helper_equipment (code, name, task_type, icon, description, sort_order, accessory_tag, work_sprite) VALUES
+('aqua_amulet', 'Aqua Amulet', 'water', '💧', 'Gives a helper water magic for crop watering.', 10, 'forest_folk_accessory', '💦'),
+('root_charm', 'Root Charm', 'till', '🌱', 'Assigns Till work to a helper.', 20, 'forest_folk_accessory', '🌱'),
+('seed_satchel', 'Seed Satchel', 'plant', '🌰', 'Assigns Plant work to a helper.', 30, 'forest_folk_accessory', '🌰'),
+('harvest_basket', 'Harvest Basket', 'harvest', '🧺', 'Assigns Harvest work to a helper.', 40, 'forest_folk_accessory', '✨'),
+('market_pouch', 'Market Pouch', 'market_sell', '👝', 'Lets a helper carry produce to market.', 80, 'forest_folk_accessory', '👝'),
+('order_stamp', 'Order Stamp', 'orders', '📮', 'Lets a helper help with order paperwork.', 90, 'forest_folk_accessory', '📮');
 
 INSERT INTO fertilizer_definitions (item_id, effect_type, effect_value, visual_icon, description) VALUES
 ((SELECT item_id FROM items WHERE code='speed_fertilizer'), 'speed_days', 1, '⚡', 'Future effect: shorten eligible crop cycles.'),
@@ -793,7 +883,7 @@ CREATE TABLE IF NOT EXISTS player_event_state (
 INSERT INTO events (event_key, title, description, is_active) VALUES
 ('madam_rune_intro', 'A Caravan Arrives', 'Madam Rune introduces herself and trades for the first relic.', 1),
 ('fairy_bell_summon', 'The Fairy Bell Rings', 'The first fairy answers the bell and becomes a water helper.', 1),
-('market_shopkeeper_invite', 'Weekend Market Invite', 'Location-driven invite that unlocks the Farmer''s Market.', 1)
+('market_shopkeeper_invite', 'Weekend Market Invite', 'Location-driven invite that unlocks the Fae Market.', 1)
 ON DUPLICATE KEY UPDATE title=VALUES(title), description=VALUES(description), is_active=VALUES(is_active);
 
 DELETE es FROM event_steps es JOIN events e ON e.event_id = es.event_id WHERE e.event_key IN ('madam_rune_intro','fairy_bell_summon','market_shopkeeper_invite');
@@ -848,7 +938,7 @@ FROM events WHERE event_key='market_shopkeeper_invite';
 
 INSERT INTO event_steps (event_id, step_order, speaker_name, title, body_html, button_text, effects_json)
 SELECT event_id, 3, 'Shopkeeper', 'The Fae Market',
-'<p>The old man chuckles. “Most folk around here have a surprise or two tucked away.”</p><p>The woman gives him a look, then turns back to you.</p><p>“The Fae Market opens every weekend from <strong>7:00 to 18:00</strong>. Our little store buys only the basics, and only so much in a day. The market is different.”</p><p>“Bring any crop you like. Market folk always have a use for good produce, and they will buy as much as you can carry.”</p><p>Her smile turns bright and conspiratorial.</p><p>“Stop by when the gates are open. It may open your eyes to a much wider world.”</p>',
+'<p>The old man chuckles. “Most folk around here have a surprise or two tucked away.”</p><p>The woman gives him a look, then turns back to you.</p><p>“The Fae Market opens every weekend from <strong>Saturday 6:00 to Sunday 18:00</strong>. Our little store buys only the basics, and only so much in a day. The market is different.”</p><p>“Bring any crop you like. Market folk always have a use for good produce, and they will buy as much as you can carry.”</p><p>Her smile turns bright and conspiratorial.</p><p>“Stop by when the gates are open. It may open your eyes to a much wider world.”</p>',
 'I’ll visit this weekend.', JSON_OBJECT('unlock_location','market')
 FROM events WHERE event_key='market_shopkeeper_invite';
 

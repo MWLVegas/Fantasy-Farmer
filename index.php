@@ -8,7 +8,7 @@ $userId = requireLogin();
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Fantasy Farmer</title>
-  <link rel="stylesheet" href="assets/css/farm.css?v=0.4.16g">
+  <link rel="stylesheet" href="assets/css/farm.css?v=0.4.16k">
 </head>
 <body>
   <header class="topbar">
@@ -79,6 +79,12 @@ $userId = requireLogin();
         <div id="sellList" class="shop-list"></div>
       </section>
 
+      <section class="tab-panel" data-panel="market">
+        <h3>Sell Crops</h3>
+        <p class="hint">The Fae Market buys any crop while the gates are open.</p>
+        <div id="marketSellList" class="shop-list"></div>
+      </section>
+
       <section class="tab-panel" data-panel="shed">
         <h3>Equipment</h3>
         <div id="machineList" class="shop-list"></div>
@@ -147,6 +153,6 @@ $userId = requireLogin();
   <script>
     window.GAME_VERSION = <?= json_encode(getAppVersion($db)) ?>;
   </script>
-  <script src="assets/js/farm.js?v=0.4.16g"></script>
+  <script src="assets/js/farm.js?v=0.4.28"></script>
 </body>
 </html>

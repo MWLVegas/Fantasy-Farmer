@@ -267,13 +267,57 @@ try {
         jsonResponse(['ok' => true, 'message' => $plant['name'] . ' planted.', 'planted_crop_id' => $plantedCropId]);
     }
 
+
+    if ($action === 'harvest_crop_problem') {
+        $problemId = (int)($input['crop_problem_id'] ?? 0);
+        if ($problemId <= 0) throw new RuntimeException('Missing problem.');
+
+        $stmt = $db->prepare("
+            SELECT cp.*, i.item_id
+            FROM crop_problems cp
+            LEFT JOIN items i ON i.code = cp.reward_item_code
+            WHERE cp.crop_problem_id = ? AND cp.user_id = ? AND cp.is_resolved = 0
+            LIMIT 1
+        ");
+        $stmt->bind_param('ii', $problemId, $userId);
+        $stmt->execute();
+        $problem = $stmt->get_result()->fetch_assoc();
+        if (!$problem) throw new RuntimeException('That problem is already cleared.');
+
+        if (!empty($problem['item_id'])) addInventory($db, $userId, (int)$problem['item_id'], 1);
+
+        $stmt = $db->prepare("UPDATE crop_problems SET is_resolved = 1, resolved_at = NOW() WHERE crop_problem_id = ? AND user_id = ?");
+        $stmt->bind_param('ii', $problemId, $userId);
+        $stmt->execute();
+
+        $cropId = (int)$problem['planted_crop_id'];
+        $stmt = $db->prepare("
+            UPDATE planted_crops pc
+            SET has_weeds = EXISTS (SELECT 1 FROM crop_problems cp WHERE cp.planted_crop_id = pc.planted_crop_id AND cp.problem_type = 'weed' AND cp.is_resolved = 0),
+                has_pests = EXISTS (SELECT 1 FROM crop_problems cp WHERE cp.planted_crop_id = pc.planted_crop_id AND cp.problem_type = 'pest' AND cp.is_resolved = 0)
+            WHERE pc.planted_crop_id = ? AND pc.user_id = ?
+        ");
+        $stmt->bind_param('ii', $cropId, $userId);
+        $stmt->execute();
+
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'Cleared ' . $problem['name'] . '.']);
+    }
+
     if ($action === 'harvest') {
         $cropId = (int) ($input['planted_crop_id'] ?? 0);
 
         $stmt = $db->prepare("
-            SELECT pc.*, p.growth_steps, p.harvest_item_id, p.harvest_min, p.harvest_max, p.name
+            SELECT pc.*, p.growth_steps, p.harvest_item_id, p.harvest_min, p.harvest_max, p.name,
+                   COALESCE(problem_counts.weed_count, 0) AS weed_count
             FROM planted_crops pc
             JOIN plants p ON p.plant_id = pc.plant_id
+            LEFT JOIN (
+                SELECT planted_crop_id, COUNT(*) AS weed_count
+                FROM crop_problems
+                WHERE problem_type = 'weed' AND is_resolved = 0
+                GROUP BY planted_crop_id
+            ) problem_counts ON problem_counts.planted_crop_id = pc.planted_crop_id
             WHERE pc.planted_crop_id = ? AND pc.user_id = ? AND pc.is_harvested = 0
             LIMIT 1
         ");
@@ -290,6 +334,9 @@ try {
         }
 
         $qty = random_int((int) $crop['harvest_min'], (int) $crop['harvest_max']);
+        if ((int)($crop['has_weeds'] ?? 0) || (int)($crop['weed_count'] ?? 0) > 0) {
+            $qty = max(1, (int)floor($qty * 0.75));
+        }
         addInventory($db, $userId, (int) $crop['harvest_item_id'], $qty);
 
         $stmt = $db->prepare("UPDATE planted_crops SET is_harvested = 1 WHERE planted_crop_id = ? AND user_id = ?");
@@ -329,6 +376,43 @@ try {
         jsonResponse(['ok' => true, 'message' => 'Harvested ×' . $qty . '.']);
     }
 
+
+    if ($action === 'change_garden_type') {
+        $gardenId = (int)($input['garden_id'] ?? 0);
+        $gardenTypeId = (int)($input['garden_type_id'] ?? 0);
+        if ($gardenId <= 0 || $gardenTypeId <= 0) throw new RuntimeException('Missing garden or garden type.');
+
+        $stmt = $db->prepare("SELECT garden_id FROM gardens WHERE garden_id = ? AND user_id = ? LIMIT 1");
+        $stmt->bind_param('ii', $gardenId, $userId);
+        $stmt->execute();
+        if (!$stmt->get_result()->fetch_assoc()) throw new RuntimeException('Garden not found.');
+
+        $stmt = $db->prepare("SELECT COUNT(*) AS c FROM planted_crops WHERE garden_id = ? AND is_harvested = 0");
+        $stmt->bind_param('i', $gardenId);
+        $stmt->execute();
+        if ((int)($stmt->get_result()->fetch_assoc()['c'] ?? 0) > 0) {
+            throw new RuntimeException('The garden must be completely empty before changing type.');
+        }
+
+        if (tableExists($db, 'player_garden_type_unlocks')) {
+            $stmt = $db->prepare("SELECT 1 FROM player_garden_type_unlocks WHERE user_id = ? AND garden_type_id = ? LIMIT 1");
+            $stmt->bind_param('ii', $userId, $gardenTypeId);
+            $stmt->execute();
+            if (!$stmt->get_result()->fetch_assoc()) throw new RuntimeException('That garden type is not unlocked yet.');
+        } else {
+            $stmt = $db->prepare("SELECT 1 FROM garden_types WHERE garden_type_id = ? AND code = 'farm' LIMIT 1");
+            $stmt->bind_param('i', $gardenTypeId);
+            $stmt->execute();
+            if (!$stmt->get_result()->fetch_assoc()) throw new RuntimeException('That garden type is not unlocked yet.');
+        }
+
+        $stmt = $db->prepare("UPDATE gardens SET garden_type_id = ? WHERE garden_id = ? AND user_id = ?");
+        $stmt->bind_param('iii', $gardenTypeId, $gardenId, $userId);
+        $stmt->execute();
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'Garden type changed.']);
+    }
+
     if ($action === 'buy_seed') {
         $itemId = (int) ($input['item_id'] ?? 0);
         $qty = max(1, (int) ($input['quantity'] ?? 1));
@@ -363,6 +447,46 @@ try {
         jsonResponse(['ok' => true, 'message' => 'Seeds bought.']);
     }
 
+
+    if ($action === 'market_buy_item') {
+        $marketStatus = getMarketStatus($db, $userId);
+        if (empty($marketStatus['is_open'])) throw new RuntimeException('The Fae Market is not open right now.');
+        $marketInventoryId = (int)($input['market_inventory_id'] ?? 0);
+        if ($marketInventoryId <= 0) throw new RuntimeException('Missing market item.');
+
+        $phase = $marketStatus['phase'] ?? 'day';
+        $stmt = $db->prepare("
+            SELECT fmi.*, i.item_id, i.name, i.base_buy_price
+            FROM fae_market_inventory fmi
+            JOIN items i ON i.item_id = fmi.item_id
+            WHERE fmi.fae_market_inventory_id = ?
+              AND fmi.is_active = 1
+              AND i.is_active = 1
+              AND (fmi.market_phase = 'both' OR fmi.market_phase = ?)
+            LIMIT 1
+        ");
+        $stmt->bind_param('is', $marketInventoryId, $phase);
+        $stmt->execute();
+        $item = $stmt->get_result()->fetch_assoc();
+        if (!$item) throw new RuntimeException('That market item is not available right now.');
+
+        $qty = max(1, (int)($item['bundle_quantity'] ?? 1));
+        $price = max(0, (int)($item['market_price'] ?? $item['base_buy_price'] ?? 0));
+        $stmt = $db->prepare("SELECT coins FROM users WHERE user_id = ? LIMIT 1");
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $user = $stmt->get_result()->fetch_assoc();
+        if (!$user || (int)$user['coins'] < $price) throw new RuntimeException('Not enough coins.');
+
+        $stmt = $db->prepare("UPDATE users SET coins = coins - ? WHERE user_id = ?");
+        $stmt->bind_param('ii', $price, $userId);
+        $stmt->execute();
+        addInventory($db, $userId, (int)$item['item_id'], $qty);
+
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'Bought ' . $item['name'] . ' ×' . $qty . '.']);
+    }
+
     if ($action === 'sell_item') {
         $itemId = (int) ($input['item_id'] ?? 0);
         $qty = max(1, (int) ($input['quantity'] ?? 1));
@@ -381,7 +505,7 @@ try {
         if ($saleContext === 'market') {
             $marketStatus = getMarketStatus($db, $userId);
             if (empty($marketStatus['is_open'])) throw new RuntimeException('The Fae Market is not open right now.');
-            if (($item['item_type'] ?? '') !== 'produce') throw new RuntimeException('The market is only buying crops right now.');
+            if (in_array(($item['item_type'] ?? ''), ['system','helper_equipment','relic'], true)) throw new RuntimeException('The market is not buying that.');
         } else {
             if (!tableExists($db, 'shop_buy_limits')) throw new RuntimeException('The shop is not buying produce right now.');
             $clock = getGameClock($db, $userId);

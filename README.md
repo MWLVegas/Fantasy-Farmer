@@ -605,3 +605,168 @@ UI/UX hotfix release.
 - Fixed growth-cycle baseline for newly planted crops. Crops now store their current cycle index when planted, so planting carrots after 6am no longer causes them to immediately catch up through every previous 6am cycle.
 - Added `database/schema_v0_4_16g.sql` to bump the database version and initialize any still-unprocessed active crops with the correct planted-time cycle baseline.
 - Bumped app/cache/database version to `v0.4.16g`.
+
+
+## v0.4.16h
+- Made the update/version mismatch warning persistent while the loaded client is out of date.
+- Reduced garden resync jumpbacks by skipping automatic state refreshes while client-trusted garden writes are pending.
+- Renamed Farmer's Market to Fae Market in UI and config defaults.
+- Changed Fae Market hours to open continuously from Saturday 06:00 through Sunday 18:00 in game time.
+- Added Fae Market day/night background scaffolding through `map_location_config.day_background_image` and `map_location_config.night_background_image`.
+- Added `fae_market_inventory` scaffolding so market offerings can later vary by `day`, `night`, or `both` phases.
+- Added `database/schema_v0_4_16h.sql` and bumped app/cache/database version to `v0.4.16h`.
+
+## v0.4.16i
+
+- Scaled garden helper draw size up as the visible field grows, so helpers stay readable when plots shrink.
+- Adjusted idle helper movement to start and wander along the garden outskirts instead of camping in the middle of the last plot.
+- Added more movement/bob while helpers are actively working.
+- Added `work_sprite` scaffolding for helper accessories/items, with emoji fallbacks used as working pop effects.
+- Added crop/seed backpack summary to the Orders Board side menu.
+- Added a grab cursor over seed pouches.
+- Added Fae Market crop selling: any produce item can be sold there while the market is open, with no daily cap.
+- Added market day/night background transition support while the player is inside the Fae Market.
+- Added background scaffolding for shop, shed, garden types, caravan, and Fae Market day/night images.
+- Added multiple-garden/garden-type scaffolding, including unlocked garden types and empty-garden-only type changes.
+- Added seed/crop garden-type restrictions using `plants.allowed_garden_types_json`, where `[0]` means all garden types.
+- Added `database/schema_v0_4_16i.sql` and bumped app/cache/database version to `v0.4.16i`.
+
+## v0.4.16j
+
+- Helper work sprites now only appear while a helper is actually working a valid crop target.
+- Idle helpers now meander around the outside border of the garden instead of parking inside plots.
+- Working helpers move a bit more around their active target.
+- Accepting an order now reopens/refreshes the order modal on the newly confirmed order.
+- Added DB-backed calendar icon support through the `nav_calendar` system item.
+- Added a clickable calendar display with human weekday names and Fae day names after the Fae Market is unlocked.
+
+## v0.4.16k
+- Fixed nav/global icons not appearing for Backpack, Orders, Map, and Calendar by adding alias fallback lookups and refreshing the Orders button markup from the DB-backed icon state.
+- Calendar label now renders image icons instead of falling back to the emoji placeholder.
+- Harvest and Inspect tool cards now use DB-backed `tool_harvest` and `tool_inspect` system icons.
+- Added `database/schema_v0_4_16k.sql` and bumped app/cache/database version to `v0.4.16k`.
+
+
+## v0.4.16l
+- Fixed Fae Market schedule to match the visible calendar: Saturday/Day of Leaves 06:00 through Sunday 18:00, continuously open overnight.
+- Corrected crop visuals so stage 0 uses `assets/icons/garden-planted-soil.png`, then stage 1+ uses `assets/icons/crops/<plant>_<stage>.png`.
+- Added a green harvest-ready glow for mature crops.
+- Added pests/weeds scaffolding with `crop_problems`, garden-type weed/pest icon JSON, harvest-to-clear behavior, inventory rewards, and market selling support.
+- Stopped water helpers from watering crops blocked by weeds or pests.
+- Expanded Fae Market selling beyond crops to sellable backpack items such as seeds, weeds, and bugs.
+- Added Fae Market buyable seed bundle scaffolding.
+- Removed text labels drawn over simple canvas location scenes.
+- Added `database/schema_v0_4_16l.sql` and bumped app/cache/database version to `v0.4.16l`.
+
+## v0.4.16m
+- Fixed DOM-backed Orders Board so `map_location_config.day_background_image` / `night_background_image` actually render behind the board.
+- Fixed background argument usage for Shop and Garden canvas scenes so location backgrounds are used as backgrounds, not accidentally treated as title icons.
+- Added `database/schema_v0_4_16m.sql` and bumped app/cache/database version to `v0.4.16m`.
+
+
+## v0.4.16n
+
+- Fixed scene background handling so all map-location canvas scenes can use `map_location_config.day_background_image` / `night_background_image`.
+- Forest Folk now uses its configured location background.
+- Caravan, Bone & Brine, Shed, Shop, Garden, Market, Orders, and Helpers now share the same location background lookup pattern.
+- If a night background is missing, the client falls back to the day background instead of showing no background.
+- Added `database/schema_v0_4_16n.sql` and bumped app/cache/database version to `v0.4.16n`.
+
+## v0.4.16o
+
+- Fixed DOM background CSS URLs so DB paths like `assets/map/orders_day.png` resolve from the app root instead of `assets/css/assets/...`.
+- Moved Fae Market buyables out of the side menu and into the market canvas as a clickable grid of market finds.
+- Added optimistic market buy/sell updates so coins and inventory counts change immediately while the database save happens in the background.
+- Added Fae Market wanderer scaffolding using `assets/market/fae/fae#.png`, with configurable wanderer count and image count in `game_config`.
+- Added randomized straight-line and meandering movement for Fae Market wanderers, including hue-shift variety.
+- Darkened Forest Folk helper cards so helper text remains readable over illustrated backgrounds.
+- Added `database/schema_v0_4_16o.sql` and bumped app/cache/database version to `v0.4.16o`.
+
+## v0.4.16p
+
+- Fixed General Store scene background lookup to support `shop`, `store`, and `general_store` location keys.
+- Prevented the General Store from using its night/secret background until the Fae Market has been introduced/unlocked.
+- Added caravan schedule scaffolding: the caravan arrives every other week from Tuesday through Thursday.
+- Added DB-backed caravan active/inactive map icons via `map_location_config.active_map_icon` and `inactive_map_icon`.
+- Added `caravan_status` to state and map sidebar timers.
+- Added Bone & Brine caravan event scaffolding that appears on the next active caravan after Strange Relic #2 is flagged as collected.
+- Added `database/schema_v0_4_16p.sql` and bumped app/cache/database version to `v0.4.16p`.
+
+## v0.4.16q
+- Fixed locked map locations showing `???`/question marks instead of their configured location art.
+- Location definitions now inherit `map_location_config.map_icon` before unlock state is applied, so locked places render as the same icon blacked out.
+- Added a defensive client fallback so locked locations prefer configured map icons even if older state payloads still include emoji fallbacks.
+- Added `database/schema_v0_4_16q.sql` and bumped app/cache/database version to `v0.4.16q`.
+
+## v0.4.28
+
+- Switched back to numeric patch versioning for normal builds.
+- Fixed locked map-location rendering at the code level instead of rewriting already-correct `map_location_config.map_icon` values.
+- Shed and Bone & Brine location definitions now use image fallbacks instead of emoji placeholders.
+- Map marker lookup now supports aliases consistently (`helpers`/`forest_folk`, `shop`/`store`/`general_store`, `market`/`fae_market`, etc.).
+- Locked locations now keep their configured art and apply the blackout effect client-side.
+- Added `database/schema_v0_4_28.sql`.
+
+
+## v0.4.29
+
+- Fae Market wanderers now recycle into newly randomized guests after they leave the screen or linger long enough, instead of reusing the same few sprites forever.
+- Fae Market wanderers stop rendering while the market is closed.
+- The Fae Market now fades to `assets/market/closed.png` when it closes, regardless of prior day/night phase.
+- Canvas scene backgrounds now crossfade when changing day/night phases or moving between locations, avoiding hard background swaps.
+- General Store sell rows now include subtle item-art row backgrounds.
+- Changed the General Store sell limit copy from “Shop wants # more today” to “Limit: #”.
+- Increased the default Fae Market wanderer image count to 18 so all current fae sprites are used.
+- Added `database/schema_v0_4_29.sql` and bumped app/cache/database version to `v0.4.29`.
+
+## v0.4.30
+
+- Added browser-side image preloading for map and location background assets.
+- The town map background stays warmed in the image cache.
+- While on the map, the currently relevant day/night background for each location is preloaded so location changes can start cleanly.
+- While inside a location, that location's day/night backgrounds are preloaded; the Fae Market also preloads its closed background and wanderer sprites.
+- Background crossfades now use a longer ~2.1 second transition instead of the previous shorter fade.
+- Added `database/schema_v0_4_30.sql` and bumped app/cache/database version to `v0.4.30`.
+
+
+## v0.4.31
+- Fae Market wanderers now enter from the bottom, wander, and exit out the bottom before recycling into a new visitor.
+- Added Fae Market wanderer config values for size, transparency, and hue shifting.
+- Location-to-location background crossfades now use a faster 1 second transition; day/night and market closed transitions keep the longer 2.1 second fade.
+- Forest Folk canvas layout tightened into two-column helper cards with a scrollable helper area and a framed Owned Accessories shelf.
+- Helper portraits now ease into a larger hover preview instead of popping instantly.
+- Forest Folk sidebar no longer shows accessory dropdowns; it now shows usable helper summon items when present.
+- Added `database/schema_v0_4_31.sql` and bumped app/cache/database version to `v0.4.31`.
+
+## v0.4.32
+- Fixed Caravan Camp map icon selection so the active caravan icon is used when the caravan is present.
+- Added active/inactive caravan background support, including `caravan_full_day/night` and `caravan_empty_day/night` paths.
+- Added overhead map day/night background support via `map_day_background_image` and `map_night_background_image`; `assets/map/map_day.png` and `assets/map/map_night.png` now resolve.
+- Made locked garden plots more transparent so they sit more naturally over the garden background.
+- Added configurable locked plot icon support through `game_config.locked_plot_icon`.
+- Added `database/schema_v0_4_32.sql` and bumped app/cache/database version to `v0.4.32`.
+
+## v0.4.33
+- Patch package is changed files only; no image assets are included.
+- Garden backgrounds now come from `garden_types.day_background_image` and `garden_types.night_background_image`.
+- Legacy `garden_types.background_image` is migrated away and dropped.
+- Default garden background paths use `assets/gardens/garden_day_(type).png` and `assets/gardens/garden_night_(type).png`.
+- Removed the map title/subtitle text from the overhead map canvas.
+- Field stats now use the regular cursor instead of text-selection cursor.
+- Night map location glow shifts from yellow to bluish purple, with a subtle night filter on map icons.
+- General Store sell rows now use editable `items.shop_row_icon` for their row background art and are easier to see.
+- Added `database/schema_v0_4_33.sql` and bumped app/cache/database version to `v0.4.33`.
+
+## v0.4.34
+
+Hotfix release. This patch removes the remaining server-side reference path that could still query `garden_types.background_image` after the v0.4.33 migration, and removes the obsolete `goblin_icon` read from the time/config payload. It also includes an idempotent schema hotfix to ensure `garden_types.day_background_image` and `garden_types.night_background_image` exist, normalize their default paths, drop `game_config.goblin_icon` when present, and bump the app version.
+
+No image assets are included in this patch.
+
+## v0.4.35
+
+- Moved garden click/use pop effect icons out of hardcoded JavaScript and into editable `items` system rows.
+- Added editable system rows for `fx_water`, `fx_till`, `fx_plant`, `fx_harvest`, `fx_dig`, `fx_pouch`, and `fx_relic`.
+- Added editable system rows for `tool_harvest` and `tool_inspect` cursor icons.
+- Updated garden cursor/effect rendering to use DB-backed system icons instead of hardcoded emoji graphics.
+- Added `database/schema_v0_4_35.sql`.

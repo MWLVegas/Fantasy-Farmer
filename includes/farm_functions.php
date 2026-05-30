@@ -49,6 +49,14 @@ function getMapConfig(mysqli $db): array
         $select .= columnExists($db, 'map_location_config', 'icon_size') ? ", icon_size" : ", NULL AS icon_size";
         $select .= columnExists($db, 'map_location_config', 'glow_color') ? ", glow_color" : ", NULL AS glow_color";
         $select .= columnExists($db, 'map_location_config', 'side_menu_html') ? ", side_menu_html" : ", NULL AS side_menu_html";
+        $select .= columnExists($db, 'map_location_config', 'day_background_image') ? ", day_background_image" : ", NULL AS day_background_image";
+        $select .= columnExists($db, 'map_location_config', 'night_background_image') ? ", night_background_image" : ", NULL AS night_background_image";
+        $select .= columnExists($db, 'map_location_config', 'active_map_icon') ? ", active_map_icon" : ", NULL AS active_map_icon";
+        $select .= columnExists($db, 'map_location_config', 'inactive_map_icon') ? ", inactive_map_icon" : ", NULL AS inactive_map_icon";
+        $select .= columnExists($db, 'map_location_config', 'active_day_background_image') ? ", active_day_background_image" : ", NULL AS active_day_background_image";
+        $select .= columnExists($db, 'map_location_config', 'active_night_background_image') ? ", active_night_background_image" : ", NULL AS active_night_background_image";
+        $select .= columnExists($db, 'map_location_config', 'inactive_day_background_image') ? ", inactive_day_background_image" : ", NULL AS inactive_day_background_image";
+        $select .= columnExists($db, 'map_location_config', 'inactive_night_background_image') ? ", inactive_night_background_image" : ", NULL AS inactive_night_background_image";
         $res = $db->query("SELECT {$select} FROM map_location_config WHERE is_active = 1 ORDER BY sort_order ASC, location_key ASC");
         if ($res) {
             while ($row = $res->fetch_assoc()) {
@@ -58,7 +66,15 @@ function getMapConfig(mysqli $db): array
                     'icon' => $row['map_icon'] ?? '',
                     'size' => (int)($row['icon_size'] ?? 78),
                     'glow_color' => $row['glow_color'] ?? 'rgba(255, 214, 94, .78)',
-                    'side_menu_html' => $row['side_menu_html'] ?? null
+                    'side_menu_html' => $row['side_menu_html'] ?? null,
+                    'day_background_image' => $row['day_background_image'] ?? null,
+                    'night_background_image' => $row['night_background_image'] ?? null,
+                    'active_map_icon' => $row['active_map_icon'] ?? null,
+                    'inactive_map_icon' => $row['inactive_map_icon'] ?? null,
+                    'active_day_background_image' => $row['active_day_background_image'] ?? null,
+                    'active_night_background_image' => $row['active_night_background_image'] ?? null,
+                    'inactive_day_background_image' => $row['inactive_day_background_image'] ?? null,
+                    'inactive_night_background_image' => $row['inactive_night_background_image'] ?? null
                 ];
             }
         }
@@ -72,6 +88,8 @@ function getMapConfig(mysqli $db): array
     return [
         'title' => $config['map_title'] ?? 'Town',
         'background_image' => $config['map_background_image'] ?? '',
+        'day_background_image' => $config['map_day_background_image'] ?? '',
+        'night_background_image' => $config['map_night_background_image'] ?? '',
         'button_positions_json' => $config['map_button_positions_json'] ?? '',
         'side_menu' => $config['map_side_menu_html'] ?? '',
         'side_menus' => $sideMenus,
@@ -109,9 +127,8 @@ function getGameClock(mysqli $db, int $userId): array
         'day_progress' => $dayProgress,
         'total_game_hours_elapsed' => $dayFloat * 24,
         'sun_icon' => $config['sun_icon'],
-        'moon_icon' => $config['moon_icon'],
-        'goblin_icon' => $config['goblin_icon'],
-        'pouch_icon' => $config['pouch_icon']
+        'moon_icon' => $config['moon_icon'] ?? '🌙',
+        'pouch_icon' => $config['pouch_icon'] ?? '🌱'
     ];
 }
 
@@ -250,9 +267,16 @@ function processGrowth(mysqli $db, int $userId): void
     $elapsedGameHours = (float) $clock['total_game_hours_elapsed'];
 
     $stmt = $db->prepare("
-        SELECT pc.*, p.growth_steps, p.cycle_hour, p.water_required, p.water_drain_per_game_hour
+        SELECT pc.*, p.growth_steps, p.cycle_hour, p.water_required, p.water_drain_per_game_hour,
+               COALESCE(problems.problem_count, 0) AS problem_count
         FROM planted_crops pc
         JOIN plants p ON p.plant_id = pc.plant_id
+        LEFT JOIN (
+            SELECT planted_crop_id, COUNT(*) AS problem_count
+            FROM crop_problems
+            WHERE is_resolved = 0
+            GROUP BY planted_crop_id
+        ) problems ON problems.planted_crop_id = pc.planted_crop_id
         WHERE pc.user_id = ? AND pc.is_harvested = 0
     ");
     $stmt->bind_param('i', $userId);
@@ -269,7 +293,7 @@ function processGrowth(mysqli $db, int $userId): void
         $lastCycle = (int) $crop['last_cycle_index'];
         $currentCycle = cycleIndexForElapsedHours($elapsedGameHours, (int) $crop['cycle_hour']);
 
-        if ($currentCycle > $lastCycle && $water >= (int) $crop['water_required'] && !(int) $crop['has_weeds'] && !(int) $crop['has_pests']) {
+        if ($currentCycle > $lastCycle && $water >= (int) $crop['water_required'] && (int)($crop['problem_count'] ?? 0) === 0 && !(int) $crop['has_weeds'] && !(int) $crop['has_pests']) {
             $advance = min($currentCycle - $lastCycle, (int) $crop['growth_steps'] - $step);
             if ($advance > 0) $step += $advance;
         }
@@ -345,6 +369,10 @@ function processHelperAutomation(mysqli $db, int $userId): void
                 JOIN plants p ON p.plant_id = pc.plant_id
                 WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0
                   AND pc.water_current < p.water_max
+                  AND pc.growth_step_current < p.growth_steps
+                  AND pc.has_weeds = 0
+                  AND pc.has_pests = 0
+                  AND NOT EXISTS (SELECT 1 FROM crop_problems cp WHERE cp.planted_crop_id = pc.planted_crop_id AND cp.is_resolved = 0)
                 ORDER BY (pc.water_current / NULLIF(p.water_max, 0)) ASC, pc.planted_crop_id ASC
                 LIMIT 1
             " );
@@ -413,9 +441,11 @@ function processHelperAutomation(mysqli $db, int $userId): void
                     if (!removeInventory($db, $userId, (int)$plant['seed_item_id'], 1)) break;
                     $x = (int)$plot['x_pos'];
                     $y = (int)$plot['y_pos'];
-                    $stmt = $db->prepare("INSERT INTO planted_crops (user_id, garden_id, plant_id, origin_x, origin_y, water_current) VALUES (?, ?, ?, ?, ?, 0)");
+                    $clock = getGameClock($db, $userId);
+                    $plantCycleIndex = cycleIndexForElapsedHours((float)$clock['total_game_hours_elapsed'], (int)$plant['cycle_hour']);
+                    $stmt = $db->prepare("INSERT INTO planted_crops (user_id, garden_id, plant_id, origin_x, origin_y, water_current, last_cycle_index) VALUES (?, ?, ?, ?, ?, 0, ?)");
                     $plantId = (int)$plant['plant_id'];
-                    $stmt->bind_param('iiiii', $userId, $gardenId, $plantId, $x, $y);
+                    $stmt->bind_param('iiiiii', $userId, $gardenId, $plantId, $x, $y, $plantCycleIndex);
                     $stmt->execute();
                     $didWork = true;
                     $targetX = $x;
@@ -460,10 +490,29 @@ function occupiedTilesForGarden(mysqli $db, int $gardenId): array
     return $occupied;
 }
 
+
+function plantAllowedInGarden(array $plant): bool
+{
+    $gardenCode = (string)($plant['garden_type_code'] ?? 'farm');
+    $gardenId = (int)($plant['current_garden_type_id'] ?? $plant['garden_type_id'] ?? 0);
+    $raw = $plant['allowed_garden_types_json'] ?? null;
+    if ($raw !== null && $raw !== '') {
+        $allowed = json_decode((string)$raw, true);
+        if (is_array($allowed)) {
+            if (in_array(0, $allowed, true) || in_array('0', $allowed, true)) return true;
+            if ($gardenId > 0 && (in_array($gardenId, $allowed, true) || in_array((string)$gardenId, $allowed, true))) return true;
+            if (in_array($gardenCode, $allowed, true)) return true;
+            return false;
+        }
+    }
+    $legacy = (string)($plant['allowed_garden_type_code'] ?? 'farm');
+    return $legacy === 'all' || $legacy === '0' || $legacy === $gardenCode;
+}
+
 function canPlacePlant(mysqli $db, int $gardenId, int $plantId, int $x, int $y): array
 {
     $stmt = $db->prepare("
-        SELECT p.*, gt.code AS garden_type_code, g.max_width, g.max_height
+        SELECT p.*, gt.garden_type_id AS current_garden_type_id, gt.code AS garden_type_code, g.max_width, g.max_height
         FROM plants p
         JOIN gardens g ON g.garden_id = ?
         JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id
@@ -478,7 +527,7 @@ function canPlacePlant(mysqli $db, int $gardenId, int $plantId, int $x, int $y):
         return ['ok' => false, 'error' => 'Plant not found.'];
     }
 
-    if ($plant['allowed_garden_type_code'] !== $plant['garden_type_code']) {
+    if (!plantAllowedInGarden($plant)) {
         return ['ok' => false, 'error' => 'This crop cannot grow in this garden type.'];
     }
 
@@ -631,7 +680,7 @@ function grantUnlock(mysqli $db, int $userId, string $unlockKey, string $source 
 
 function ensureStartingUnlocks(mysqli $db, int $userId): void
 {
-    foreach (['location_map','location_garden','location_shop','orders_board'] as $key) {
+    foreach (['location_map','location_garden','location_shop','orders_board','location_caravan'] as $key) {
         grantUnlock($db, $userId, $key, 'starting_state');
     }
 }
@@ -770,43 +819,98 @@ function getMarketStatus(mysqli $db, int $userId): array
     $absoluteDay = max(1, (int)($clock['absolute_day'] ?? 1));
     $hour = (int)($clock['hour'] ?? 0);
     $minute = (int)($clock['minute'] ?? 0);
-    $secondsIntoDay = ($hour * 3600) + ($minute * 60);
     $dayLength = max(60, (int)($clock['day_length_seconds'] ?? 720));
-    $weekDay = (($absoluteDay - 1) % 7) + 1; // 6 and 7 are the weekend market days.
-    $openHour = 7;
+
+    // Match the client calendar: 0 = Sunday, 1 = Monday, ... 6 = Saturday.
+    // The Fae Market opens Saturday 06:00 and stays open continuously until Sunday 18:00.
+    $weekIndex = ($absoluteDay - 1) % 7;
+    $openHour = 6;
     $closeHour = 18;
-    $isWeekend = $weekDay >= 6;
-    $isOpenHours = $hour >= $openHour && $hour < $closeHour;
-    $isOpen = $isWeekend && $isOpenHours;
 
     $openOffset = (int)round(($openHour / 24) * $dayLength);
     $closeOffset = (int)round(($closeHour / 24) * $dayLength);
     $currentOffset = (int)round((($hour * 60 + $minute) / 1440) * $dayLength);
 
-    if ($isOpen) {
-        $secondsRemaining = max(0, $closeOffset - $currentOffset);
-        $label = 'Market closes';
-    } else {
-        $daysUntilMarket = 0;
-        if ($weekDay <= 5) $daysUntilMarket = 6 - $weekDay;
-        elseif ($weekDay === 6 && $hour >= $closeHour) $daysUntilMarket = 1;
-        elseif ($weekDay === 7 && $hour >= $closeHour) $daysUntilMarket = 6;
-        elseif ($weekDay === 7) $daysUntilMarket = 0;
+    $isOpen = ($weekIndex === 6 && $currentOffset >= $openOffset) || ($weekIndex === 0 && $currentOffset < $closeOffset);
+    $isWeekend = ($weekIndex === 6 || $weekIndex === 0);
+    $phase = ($hour >= 6 && $hour < 18) ? 'day' : 'night';
 
-        $targetOffset = $openOffset;
-        $secondsRemaining = ($daysUntilMarket * $dayLength) + $targetOffset - $currentOffset;
-        if ($secondsRemaining < 0) $secondsRemaining += $dayLength;
-        $label = 'Market opens';
+    if ($isOpen) {
+        $secondsRemaining = $weekIndex === 6
+            ? max(0, $dayLength + $closeOffset - $currentOffset)
+            : max(0, $closeOffset - $currentOffset);
+        $label = 'Fae Market closes';
+    } else {
+        if ($weekIndex >= 1 && $weekIndex <= 5) $daysUntilOpen = 6 - $weekIndex;
+        elseif ($weekIndex === 6) $daysUntilOpen = ($currentOffset < $openOffset) ? 0 : 7;
+        else $daysUntilOpen = 6;
+
+        $secondsRemaining = ($daysUntilOpen * $dayLength) + $openOffset - $currentOffset;
+        if ($secondsRemaining < 0) $secondsRemaining += 7 * $dayLength;
+        $label = 'Fae Market opens';
     }
 
     return [
         'is_open' => $isOpen,
         'is_weekend' => $isWeekend,
-        'weekday' => $weekDay,
+        'weekday' => $weekIndex,
+        'week_index' => $weekIndex,
         'open_hour' => $openHour,
         'close_hour' => $closeHour,
         'label' => $label,
+        'phase' => $phase,
         'seconds_remaining' => $secondsRemaining
+    ];
+}
+
+
+function getCaravanStatus(mysqli $db, int $userId): array
+{
+    $clock = getGameClock($db, $userId);
+    $config = getGameConfig($db);
+    $absoluteDay = max(1, (int)($clock['absolute_day'] ?? 1));
+    $hour = (int)($clock['hour'] ?? 0);
+    $minute = (int)($clock['minute'] ?? 0);
+    $dayLength = max(60, (int)($clock['day_length_seconds'] ?? 720));
+    $weekIndex = ($absoluteDay - 1) % 7; // 0 Sunday, 1 Monday, 2 Tuesday, 3 Wednesday, 4 Thursday
+    $weekNumber = (int)floor(($absoluteDay - 1) / 7);
+    $offset = (int)($config['caravan_biweekly_offset'] ?? 0);
+    $activeWeek = (($weekNumber - $offset) % 2) === 0;
+    $isActive = $activeWeek && $weekIndex >= 2 && $weekIndex <= 4;
+    $currentOffset = (int)round((($hour * 60 + $minute) / 1440) * $dayLength);
+
+    if ($isActive) {
+        // End of Thursday, just before Friday begins.
+        $secondsRemaining = ((4 - $weekIndex) * $dayLength) + ($dayLength - $currentOffset);
+        $label = 'Caravan leaves';
+    } else {
+        $daysUntil = 0;
+        for ($i = 0; $i < 14; $i++) {
+            $candidateAbs = $absoluteDay + $i;
+            $candidateWeekIndex = ($candidateAbs - 1) % 7;
+            $candidateWeekNumber = (int)floor(($candidateAbs - 1) / 7);
+            $candidateActiveWeek = (($candidateWeekNumber - $offset) % 2) === 0;
+            if ($candidateActiveWeek && $candidateWeekIndex === 2) {
+                $daysUntil = $i;
+                break;
+            }
+        }
+        $secondsRemaining = ($daysUntil * $dayLength) - $currentOffset;
+        if ($secondsRemaining < 0) $secondsRemaining += 14 * $dayLength;
+        $label = 'Caravan arrives';
+    }
+
+    $boneBrineReady = (hasUnlock($db, $userId, 'second_relic_collected') || hasUnlock($db, $userId, 'strange_relic_2_collected'))
+        && !hasUnlock($db, $userId, 'location_bone_brine');
+
+    return [
+        'is_active' => $isActive,
+        'weekday' => $weekIndex,
+        'active_week' => $activeWeek,
+        'seconds_remaining' => max(0, $secondsRemaining),
+        'label' => $label,
+        'bone_brine_ready' => $boneBrineReady,
+        'visitor_key' => ($isActive && $boneBrineReady) ? 'bone_brine' : (($isActive) ? 'standard' : '')
     ];
 }
 
@@ -815,7 +919,8 @@ function getShopSellLimits(mysqli $db, int $userId): array
     if (!tableExists($db, 'shop_buy_limits')) return [];
     $clock = getGameClock($db, $userId);
     $shopDay = (int)($clock['absolute_day'] ?? 1);
-    $stmt = $db->prepare("\n        SELECT i.item_id, i.code, i.name, i.icon, i.base_sell_price, sbl.daily_limit,\n               COALESCE(sold.quantity_sold, 0) AS quantity_sold,\n               GREATEST(0, sbl.daily_limit - COALESCE(sold.quantity_sold, 0)) AS remaining_quantity\n        FROM shop_buy_limits sbl\n        JOIN items i ON i.item_id = sbl.item_id\n        LEFT JOIN player_shop_sales sold\n          ON sold.user_id = ? AND sold.item_id = i.item_id AND sold.shop_day = ?\n        WHERE sbl.is_active = 1 AND i.is_active = 1\n        ORDER BY i.base_sell_price ASC, i.name ASC\n    ");
+    $shopRowIconSelect = columnExists($db, 'items', 'shop_row_icon') ? "i.shop_row_icon" : "NULL AS shop_row_icon";
+    $stmt = $db->prepare("\n        SELECT i.item_id, i.code, i.name, i.icon, {$shopRowIconSelect}, i.base_sell_price, sbl.daily_limit,\n               COALESCE(sold.quantity_sold, 0) AS quantity_sold,\n               GREATEST(0, sbl.daily_limit - COALESCE(sold.quantity_sold, 0)) AS remaining_quantity\n        FROM shop_buy_limits sbl\n        JOIN items i ON i.item_id = sbl.item_id\n        LEFT JOIN player_shop_sales sold\n          ON sold.user_id = ? AND sold.item_id = i.item_id AND sold.shop_day = ?\n        WHERE sbl.is_active = 1 AND i.is_active = 1\n        ORDER BY i.base_sell_price ASC, i.name ASC\n    ");
     if (!$stmt) return [];
     $stmt->bind_param('ii', $userId, $shopDay);
     if (!@$stmt->execute()) return [];
@@ -846,18 +951,57 @@ function getLocationsForPlayer(mysqli $db, int $userId): array
         ['key'=>'garden','name'=>'Garden','icon'=>'assets/map/garden.png','unlock'=>'location_garden','hint'=>'Your growing field.'],
         ['key'=>'shop','name'=>'General Store','icon'=>'assets/map/store.png','unlock'=>'location_shop','hint'=>'Basic seeds, tools, and a weekly special.'],
         ['key'=>'orders','name'=>'Orders Board','icon'=>'assets/map/orders.png','unlock'=>'orders_board','hint'=>'Requests from townsfolk.'],
-        ['key'=>'shed','name'=>'Workroom / Shed','icon'=>'🛖','unlock'=>'location_shed','hint'=>'Processing and equipment live here.'],
-        ['key'=>'market','name'=>'Farmer\'s Market','icon'=>'🎪','unlock'=>'location_market','hint'=>'Unlocks at 10 reputation after the shopkeeper invite.'],
+        ['key'=>'shed','name'=>'Workroom / Shed','icon'=>'assets/map/shed.png','unlock'=>'location_shed','hint'=>'Processing and equipment live here.'],
+        ['key'=>'market','name'=>'Fae Market','icon'=>'assets/map/market.png','unlock'=>'location_market','hint'=>'Unlocks after the shopkeeper invitation.'],
         ['key'=>'caravan','name'=>'Caravan Camp','icon'=>'assets/map/caravan_empty.png','unlock'=>'location_caravan','hint'=>'Unlocked by relic-driven visitor events.'],
-        ['key'=>'bone_brine','name'=>'Bone & Brine','icon'=>'☠️','unlock'=>'location_bone_brine','hint'=>'Permanent oddities stall after their relic event.'],
+        ['key'=>'bone_brine','name'=>'Bone & Brine','icon'=>'assets/map/bone_brine.png','unlock'=>'location_bone_brine','hint'=>'Permanent oddities stall after their relic event.'],
         ['key'=>'helpers','name'=>'Forest Folk','icon'=>'assets/map/fairy_folk.png','unlock'=>'helpers_unlocked','hint'=>'Summoned helpers using bells and equipped amulets.'],
     ];
 
     $marketStatus = getMarketStatus($db, $userId);
+    $caravanStatus = getCaravanStatus($db, $userId);
+    $mapConfigForLocations = getMapConfig($db);
+    $locationMarkersForLocations = $mapConfigForLocations['location_markers'] ?? [];
+
+    $locationAliases = [
+        'shop' => ['shop', 'store', 'general_store'],
+        'helpers' => ['helpers', 'forest_folk'],
+        'market' => ['market', 'fae_market'],
+        'bone_brine' => ['bone_brine', 'bone_brine_shop'],
+        'shed' => ['shed', 'workroom'],
+    ];
 
     foreach ($defs as &$def) {
+        $markerForDef = [];
+        foreach (($locationAliases[$def['key']] ?? [$def['key']]) as $markerKey) {
+            if (!empty($locationMarkersForLocations[$markerKey])) {
+                $markerForDef = $locationMarkersForLocations[$markerKey];
+                break;
+            }
+        }
+        if (!empty($markerForDef['icon'])) {
+            // Location definitions should never fall back to emoji placeholders when
+            // DB-backed map art exists. Locked locations use this same icon and apply
+            // the blackout filter client-side.
+            $def['icon'] = $markerForDef['icon'];
+        }
         $def['unlocked'] = !empty($unlocks[$def['unlock']]);
         $def['disabled'] = false;
+        if ($def['key'] === 'caravan') {
+            $def['caravan_status'] = $caravanStatus;
+            $caravanMarker = $locationMarkersForLocations['caravan'] ?? [];
+            $inactiveIcon = $caravanMarker['inactive_map_icon'] ?? $caravanMarker['icon'] ?? $def['icon'];
+            $activeIcon = $caravanMarker['active_map_icon'] ?? $inactiveIcon;
+            $def['icon'] = !empty($caravanStatus['is_active']) ? $activeIcon : $inactiveIcon;
+            if ($def['unlocked'] && empty($caravanStatus['is_active'])) {
+                $def['hint'] = 'The caravan camp is empty right now.';
+            } elseif ($def['unlocked'] && !empty($caravanStatus['bone_brine_ready'])) {
+                $def['hint'] = 'A Bone & Brine caravan is waiting at the camp.';
+            } elseif ($def['unlocked']) {
+                $def['hint'] = 'The caravan has arrived with temporary visitors.';
+            }
+        }
+
         if ($def['key'] === 'market') {
             $def['is_open'] = (bool)$marketStatus['is_open'];
             $def['market_status'] = $marketStatus;
@@ -865,7 +1009,7 @@ function getLocationsForPlayer(mysqli $db, int $userId): array
                 $def['disabled'] = true;
                 $def['hint'] = 'The Fae Market is not open right now.';
             } elseif ($def['unlocked']) {
-                $def['hint'] = 'The Fae Market is open. They buy any crop, with no daily limit.';
+                $def['hint'] = 'The Fae Market is open. They buy crops, seeds, weeds, bugs, and other oddities.';
             } elseif ($progress['reputation'] >= 10) {
                 // Reputation creates a shop event marker; accepting that event grants location_market.
                 $def['can_unlock'] = false;
@@ -879,7 +1023,7 @@ function getLocationsForPlayer(mysqli $db, int $userId): array
 
 function maybeGrantMarketInvite(mysqli $db, int $userId): void
 {
-    // v0.4.16d: reputation no longer silently unlocks the Farmer's Market.
+    // v0.4.16d: reputation no longer silently unlocks the Fae Market.
     // It now creates a location-driven event marker handled by getLocationEvents().
 }
 
@@ -896,6 +1040,19 @@ function getLocationEvents(mysqli $db, int $userId): array
             'location_key' => 'shop',
             'title' => 'Fae Market Invitation',
             'tooltip' => 'The shopkeepers have something to tell you.',
+            'icon' => systemIconByCode($db, 'quest_available', '!')
+        ];
+    }
+
+    $caravanStatus = getCaravanStatus($db, $userId);
+    if (!empty($caravanStatus['is_active'])
+        && !empty($caravanStatus['bone_brine_ready'])
+        && eventHasFirstStep($db, 'bone_brine_caravan_intro')) {
+        $events[] = [
+            'event_key' => 'bone_brine_caravan_intro',
+            'location_key' => 'caravan',
+            'title' => 'A Questionable Caravan',
+            'tooltip' => 'A Bone & Brine wagon has arrived after your second strange relic.',
             'icon' => systemIconByCode($db, 'quest_available', '!')
         ];
     }
