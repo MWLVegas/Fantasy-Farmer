@@ -770,3 +770,31 @@ No image assets are included in this patch.
 - Added editable system rows for `tool_harvest` and `tool_inspect` cursor icons.
 - Updated garden cursor/effect rendering to use DB-backed system icons instead of hardcoded emoji graphics.
 - Added `database/schema_v0_4_35.sql`.
+
+## v0.4.36
+
+- Garden plot tiles now use DB-backed system item icons instead of canvas-drawn plot graphics.
+- Added editable system icon rows:
+  - `plot_untilled` → `assets/icons/plot-untilled.png`
+  - `plot_partial` → `assets/icons/plot-partial.png`
+  - `plot_tilled` → `assets/icons/plot-tilled.png`
+- Locked plots now render the configured untilled plot image at reduced opacity with the DB-configured lock icon over it.
+- Added `database/schema_v0_4_36.sql`.
+- Bumped app/database version to `v0.4.36`.
+
+## v0.4.37
+
+Changed-files-only patch.
+
+- General Store canvas buy slots now draw subtle item background art using DB-backed row icons.
+- Added `plants.max_cycles` as the stored crop stage/cycle count.
+- Removed `plants.stage_icons_json` from the current schema/migration path.
+- Crop stage images are now derived automatically as `assets/icons/crops/<plant>_<stage>.png`.
+- Tomato is corrected to 3 cycles.
+- Expired and cancelled orders are deleted permanently instead of retained as historical rows.
+- Added order/garden hot-path indexes:
+  - `player_orders (user_id, order_status)`
+  - `order_items (player_order_id)`
+  - `planted_crops (garden_id, is_harvested)`
+- Added DB-configurable `game_config.locked_plot_opacity`, default `0.58`.
+- Locked plot image opacity increased from the too-faint hardcoded value.

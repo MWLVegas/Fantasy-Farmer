@@ -120,6 +120,13 @@ function actionFxIcon(kind) {
   return systemIcon(`fx_${kind}`, '');
 }
 
+function plotTileIconForPlot(plot) {
+  if (!plot || !Number(plot.is_unlocked)) return systemIcon('plot_untilled', '');
+  if (Number(plot.is_tilled)) return systemIcon('plot_tilled', '');
+  if (Number(plot.till_progress || 0) > 0) return systemIcon('plot_partial', '');
+  return systemIcon('plot_untilled', '');
+}
+
 function questIcon() {
   return systemIcon('quest_available', '!');
 }
@@ -672,11 +679,15 @@ function parseJsonArray(value) {
   }
 }
 
+function cropAssetCode(crop) {
+  return String(crop?.crop_image_code || crop?.code || '').replace(/_bush$/, '');
+}
+
 function iconForCrop(crop) {
   const step = Number(crop.growth_step_current || 0);
   if (step <= 0) return systemIcon('garden_planted_soil', 'assets/icons/garden-planted-soil.png');
-  const stageIcons = parseJsonArray(crop.stage_icons_json);
-  if (stageIcons.length) return stageIcons[Math.min(stageIcons.length - 1, step - 1)] || stageIcons[stageIcons.length - 1];
+  const code = cropAssetCode(crop);
+  if (code) return `assets/icons/crops/${code}_${step}.png`;
   return crop.mature_icon || crop.seed_icon || '🌱';
 }
 
@@ -989,7 +1000,6 @@ function performTileAction(hit, pointerPos = null, repeating = false) {
       harvest_max: plant.harvest_max || '?',
       seed_icon: plant.seed_icon,
       mature_icon: plant.mature_icon || plant.seed_icon,
-      stage_icons_json: plant.stage_icons_json || '[]',
       has_weeds: 0,
       has_pests: 0
     });
@@ -1154,42 +1164,22 @@ function confirmUnlockPlot(plot) {
 
 function drawSoilTile(plot, rect) {
   const unlocked = Number(plot.is_unlocked);
-  const till = Number(plot.till_progress || 0);
-  const tilled = Number(plot.is_tilled);
+  const tileIcon = plotTileIconForPlot(plot);
 
   ctx.save();
+
+  if (tileIcon) {
+    ctx.globalAlpha = unlocked ? 1 : Math.max(0.15, Math.min(1, Number(state?.ui_config?.locked_plot_opacity ?? 0.58)));
+    drawIcon(tileIcon, rect.cx, rect.cy, rect.size);
+  }
+
   if (!unlocked) {
-    ctx.globalAlpha = .34;
-    ctx.fillStyle = '#17140f';
-    ctx.strokeStyle = 'rgba(255,255,255,.08)';
-    fillStrokeRound(rect.x, rect.y, rect.size, rect.size, 10);
-    ctx.globalAlpha = .68;
-    drawIcon(state?.ui_config?.locked_plot_icon || '🔒', rect.cx, rect.cy, rect.size * .24);
+    ctx.globalAlpha = .62;
+    drawIcon(state?.ui_config?.locked_plot_icon || '', rect.cx, rect.cy, rect.size * .24);
     ctx.restore();
     return;
   }
 
-  ctx.fillStyle = tilled ? '#7a5231' : '#684225';
-  ctx.strokeStyle = 'rgba(255,255,255,.08)';
-  fillStrokeRound(rect.x, rect.y, rect.size, rect.size, 10);
-
-  ctx.globalAlpha = .22 + (till / 100) * .28;
-  ctx.strokeStyle = '#d9b071';
-  ctx.lineWidth = 2;
-  for (let i = 0; i < 7; i++) {
-    const yy = rect.y + 14 + i * (rect.size - 28) / 7;
-    ctx.beginPath();
-    ctx.moveTo(rect.x + 10, yy);
-    ctx.quadraticCurveTo(rect.cx, yy + (i % 2 ? 6 : -6), rect.x + rect.size - 10, yy + 2);
-    ctx.stroke();
-  }
-
-  if (till > 0 && till < 100) {
-    ctx.globalAlpha = .85;
-    ctx.fillStyle = '#d9a441';
-    roundedPath(rect.x + 10, rect.y + rect.size - 12, (rect.size - 20) * (till / 100), 4, 4);
-    ctx.fill();
-  }
   ctx.restore();
 }
 
@@ -1803,6 +1793,7 @@ function caravanBackgroundForNow() {
 function preloadAssetsForScreen(tab = currentTabName()) {
   if (!state) return;
   const assets = [];
+  assets.push(plotTileIconForPlot({ is_unlocked: 1, is_tilled: 0, till_progress: 0 }), plotTileIconForPlot({ is_unlocked: 1, is_tilled: 0, till_progress: 50 }), plotTileIconForPlot({ is_unlocked: 1, is_tilled: 1, till_progress: 100 }));
   assets.push(mapBackgroundForNow(), state?.map_config?.background_image || '', state?.map_config?.day_background_image || 'assets/map/map_day.png', state?.map_config?.night_background_image || 'assets/map/map_night.png');
 
   if (tab === 'map') {
@@ -2707,13 +2698,13 @@ function weeklySpecialItems() {
   const woodenHoe = (state.all_tools || []).find(t => t.code === 'wooden_hoe');
   const ownsWoodenHoe = (state.tools || []).some(t => t.code === 'wooden_hoe');
   if (woodenHoe && !ownsWoodenHoe) {
-    return [{ tool: woodenHoe, icon: woodenHoe.icon, name: 'Weekly Special: Wooden Hoe', price: Number(woodenHoe.upgrade_cost || 75), action: () => buyToolFromCanvas(woodenHoe) }];
+    return [{ tool: woodenHoe, icon: woodenHoe.icon, rowIcon: woodenHoe.icon, name: 'Weekly Special: Wooden Hoe', price: Number(woodenHoe.upgrade_cost || 75), action: () => buyToolFromCanvas(woodenHoe) }];
   }
   const deed = (state.inventory || []).find(i => i.code === 'land_claim_note') || { code: 'land_claim_note', icon: '📜', name: 'Land Claim Note', base_buy_price: 175, quantity: 0 };
   const purchased = Number(state.land_claim_shop_purchases || 0);
   if (purchased >= 3) return [];
   const price = Number(deed.base_buy_price || 175) + (purchased * 75);
-  return [{ icon: deed.icon || '📜', name: `Special: Land Claim Note (${3 - purchased} left at shop)`, price, action: () => buySpecialItemFromCanvas('land_claim_note', { ...deed, base_buy_price: price }) }];
+  return [{ icon: deed.icon || '📜', rowIcon: deed.shop_row_icon || deed.icon || '📜', name: `Special: Land Claim Note (${3 - purchased} left at shop)`, price, action: () => buySpecialItemFromCanvas('land_claim_note', { ...deed, base_buy_price: price }) }];
 }
 
 function drawShopCanvas() {
@@ -2722,8 +2713,8 @@ function drawShopCanvas() {
   const shopIcon = locationIconFor('shop', '🏪', ['store', 'general_store']);
   drawPanelBackground(shopIcon, locationBackgroundForNow('shop', ['store', 'general_store'], { forceDay: hideSecretNight }));
   const rows = [
-    { title: '🌱', y: 58, items: (state.plants || []).map(p => ({ plant: p, icon: p.seed_icon, name: p.seed_name || p.name, price: Number(p.base_buy_price || 0), action: () => buySeedFromCanvas(p) })) },
-    { title: '🛠️', y: 248, items: (state.all_machines || []).map(m => ({ machine: m, icon: m.icon, name: m.name, price: Number(m.base_cost || 0), action: () => buyMachineFromCanvas(m) })) },
+    { title: '🌱', y: 58, items: (state.plants || []).map(p => ({ plant: p, icon: p.seed_icon, rowIcon: p.seed_shop_row_icon || p.seed_icon, name: p.seed_name || p.name, price: Number(p.base_buy_price || 0), action: () => buySeedFromCanvas(p) })) },
+    { title: '🛠️', y: 248, items: (state.all_machines || []).map(m => ({ machine: m, icon: m.icon, rowIcon: m.icon, name: m.name, price: Number(m.base_cost || 0), action: () => buyMachineFromCanvas(m) })) },
     { title: '✨', y: 438, items: weeklySpecialItems() }
   ];
   const slot = 112, gap = 16, startX = 90;
@@ -2734,6 +2725,13 @@ function drawShopCanvas() {
       const affordable = Number(state.user.coins) >= item.price;
       const disabled = item.disabled || (!affordable && item.price > 0);
       drawCanvasSlot(x, y, slot, slot, { alpha: disabled ? .58 : 1, stroke: affordable || item.price === 0 ? 'rgba(255,255,255,.16)' : 'rgba(255,135,120,.32)' });
+      const bgIcon = item.rowIcon || item.shop_row_icon || item.icon || '';
+      if (bgIcon && isImageIcon(bgIcon)) {
+        ctx.save();
+        ctx.globalAlpha = disabled ? .18 : .28;
+        drawIcon(bgIcon, x + slot / 2, y + slot / 2, slot * .92);
+        ctx.restore();
+      }
       ctx.globalAlpha = disabled ? .45 : 1;
       drawIcon(item.icon || '❔', x + slot / 2, y + 44, 46);
       ctx.globalAlpha = 1;

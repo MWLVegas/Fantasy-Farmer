@@ -4,6 +4,7 @@ require_once __DIR__ . '/../includes/bootstrap.php';
 $userId = requireLogin();
 ensurePlayerDefaults($db, $userId);
 ensureActiveOrder($db, $userId);
+cleanupDeadOrders($db, $userId);
 processGrowth($db, $userId);
 processHelperAutomation($db, $userId);
 
@@ -14,6 +15,8 @@ $user = $stmt->get_result()->fetch_assoc();
 
 $gardenDayBgSelect = columnExists($db, 'garden_types', 'day_background_image') ? "gt.day_background_image AS day_background_image" : "NULL AS day_background_image";
 $gardenNightBgSelect = columnExists($db, 'garden_types', 'night_background_image') ? "gt.night_background_image AS night_background_image" : "NULL AS night_background_image";
+$plantCyclesSelect = columnExists($db, 'plants', 'max_cycles') ? 'p.max_cycles' : 'p.growth_steps';
+$seedShopRowIconSelect = columnExists($db, 'items', 'shop_row_icon') ? 'i.shop_row_icon AS seed_shop_row_icon' : 'NULL AS seed_shop_row_icon';
 
 $stmt = $db->prepare("
     SELECT g.*, gt.code AS garden_type_code, gt.name AS garden_type_name, gt.icon AS garden_type_icon, {$gardenDayBgSelect}, {$gardenNightBgSelect}
@@ -67,8 +70,8 @@ $stmt->execute();
 $plots = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->prepare("
-    SELECT pc.*, p.name, p.code, p.width, p.height, p.growth_steps, p.cycle_hour, p.water_max, p.water_required,
-           p.stage_icons_json, p.harvest_min, p.harvest_max, hi.icon AS mature_icon, si.icon AS seed_icon, p.harvest_item_id,
+    SELECT pc.*, p.name, p.code, p.width, p.height, {$plantCyclesSelect} AS growth_steps, p.cycle_hour, p.water_max, p.water_required,
+           p.harvest_min, p.harvest_max, hi.icon AS mature_icon, si.icon AS seed_icon, p.harvest_item_id,
            COALESCE(problem_counts.weed_count, 0) AS weed_count,
            COALESCE(problem_counts.pest_count, 0) AS pest_count
     FROM planted_crops pc
@@ -89,8 +92,8 @@ $stmt->execute();
 $crops = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->query("
-    SELECT p.plant_id, p.code, p.name, p.width, p.height, p.growth_steps, p.water_max, p.harvest_min, p.harvest_max,
-           p.stage_icons_json, p.allowed_garden_type_code, p.allowed_garden_types_json, hi.icon AS mature_icon, i.icon AS seed_icon, p.seed_item_id, i.base_buy_price, i.name AS seed_name
+    SELECT p.plant_id, p.code, p.name, p.width, p.height, {$plantCyclesSelect} AS growth_steps, p.water_max, p.harvest_min, p.harvest_max,
+           {$plantCyclesSelect} AS max_cycles, p.allowed_garden_type_code, p.allowed_garden_types_json, hi.icon AS mature_icon, i.icon AS seed_icon, {$seedShopRowIconSelect}, p.seed_item_id, i.base_buy_price, i.name AS seed_name
     FROM plants p
     JOIN items i ON i.item_id = p.seed_item_id
     JOIN items hi ON hi.item_id = p.harvest_item_id
@@ -393,6 +396,7 @@ $uiConfig = [
     'fae_market_wanderer_alpha' => (float)($gameConfig['fae_market_wanderer_alpha'] ?? .84),
     'fae_market_wanderer_hue_shift_enabled' => (int)($gameConfig['fae_market_wanderer_hue_shift_enabled'] ?? 1),
     'locked_plot_icon' => $gameConfig['locked_plot_icon'] ?? '🔒',
+    'locked_plot_opacity' => isset($gameConfig['locked_plot_opacity']) ? (float)$gameConfig['locked_plot_opacity'] : 0.58,
 ];
 
 jsonResponse([

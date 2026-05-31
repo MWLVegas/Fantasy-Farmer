@@ -263,11 +263,12 @@ function removeInventory(mysqli $db, int $userId, int $itemId, int $quantity): b
 
 function processGrowth(mysqli $db, int $userId): void
 {
+    $cyclesSql = plantCyclesSql($db, 'p');
     $clock = getGameClock($db, $userId);
     $elapsedGameHours = (float) $clock['total_game_hours_elapsed'];
 
     $stmt = $db->prepare("
-        SELECT pc.*, p.growth_steps, p.cycle_hour, p.water_required, p.water_drain_per_game_hour,
+        SELECT pc.*, {$cyclesSql} AS growth_steps, p.cycle_hour, p.water_required, p.water_drain_per_game_hour,
                COALESCE(problems.problem_count, 0) AS problem_count
         FROM planted_crops pc
         JOIN plants p ON p.plant_id = pc.plant_id
@@ -314,6 +315,7 @@ function processGrowth(mysqli $db, int $userId): void
 
 function processHelperAutomation(mysqli $db, int $userId): void
 {
+    $cyclesSql = plantCyclesSql($db, 'p');
     $ready = $db->query("SELECT COUNT(*) AS c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'player_helpers' AND COLUMN_NAME = 'last_action_at'");
     if (!$ready || (int)($ready->fetch_assoc()['c'] ?? 0) === 0) return;
 
@@ -369,7 +371,7 @@ function processHelperAutomation(mysqli $db, int $userId): void
                 JOIN plants p ON p.plant_id = pc.plant_id
                 WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0
                   AND pc.water_current < p.water_max
-                  AND pc.growth_step_current < p.growth_steps
+                  AND pc.growth_step_current < {$cyclesSql}
                   AND pc.has_weeds = 0
                   AND pc.has_pests = 0
                   AND NOT EXISTS (SELECT 1 FROM crop_problems cp WHERE cp.planted_crop_id = pc.planted_crop_id AND cp.is_resolved = 0)
@@ -411,7 +413,7 @@ function processHelperAutomation(mysqli $db, int $userId): void
                 $targetY = (int)$plot['y_pos'];
             }
         } elseif ($task === 'harvest') {
-            $stmt = $db->prepare("\n                SELECT pc.planted_crop_id, pc.origin_x, pc.origin_y, p.harvest_item_id, p.harvest_min\n                FROM planted_crops pc\n                JOIN plants p ON p.plant_id = pc.plant_id\n                WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0\n                  AND pc.growth_step_current >= p.growth_steps\n                ORDER BY pc.planted_crop_id ASC\n                LIMIT 1\n            ");
+            $stmt = $db->prepare("\n                SELECT pc.planted_crop_id, pc.origin_x, pc.origin_y, p.harvest_item_id, p.harvest_min\n                FROM planted_crops pc\n                JOIN plants p ON p.plant_id = pc.plant_id\n                WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0\n                  AND pc.growth_step_current >= {$cyclesSql}\n                ORDER BY pc.planted_crop_id ASC\n                LIMIT 1\n            ");
             $stmt->bind_param('ii', $userId, $gardenId);
             $stmt->execute();
             $crop = $stmt->get_result()->fetch_assoc();
@@ -698,10 +700,25 @@ function configInt(array $config, string $key, int $default): int
     return isset($config[$key]) ? (int)$config[$key] : $default;
 }
 
+
+function plantCyclesSql(mysqli $db, string $alias = 'p'): string
+{
+    return columnExists($db, 'plants', 'max_cycles') ? "$alias.max_cycles" : "$alias.growth_steps";
+}
+
 function getAvailableOrderLimit(mysqli $db): int
 {
     $config = getGameConfig($db);
     return max(1, configInt($config, 'max_available_orders', 5));
+}
+
+function cleanupDeadOrders(mysqli $db, int $userId): void
+{
+    if (!tableExists($db, 'player_orders')) return;
+    $stmt = $db->prepare("DELETE FROM player_orders WHERE user_id = ? AND (order_status IN ('expired','cancelled') OR is_expired = 1 OR (order_status = 'available' AND expires_at < NOW()))");
+    if (!$stmt) return;
+    $stmt->bind_param('i', $userId);
+    @$stmt->execute();
 }
 
 function randomMinuteRange(array $config, string $minKey, string $maxKey, int $minDefault, int $maxDefault): int
@@ -715,10 +732,8 @@ function ensureActiveOrders(mysqli $db, int $userId): void
 {
     $config = getGameConfig($db);
 
-    // Available orders expire off the board. Accepted orders do NOT disappear; they only become late.
-    $stmt = $db->prepare("UPDATE player_orders SET order_status='expired', is_expired=1 WHERE user_id=? AND order_status='available' AND expires_at<NOW()");
-    $stmt->bind_param('i', $userId);
-    $stmt->execute();
+    // Available orders expire off the board and are deleted permanently. Accepted orders do NOT disappear; they only become late.
+    cleanupDeadOrders($db, $userId);
 
     // Available orders are only confirmed when the player accepts them. Old available rows simply expire off the board.
 

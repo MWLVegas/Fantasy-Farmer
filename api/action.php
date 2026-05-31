@@ -5,6 +5,7 @@ $userId = requireLogin();
 ensurePlayerDefaults($db, $userId);
 
 $input = json_decode(file_get_contents('php://input'), true) ?: [];
+$plantCyclesSelect = columnExists($db, 'plants', 'max_cycles') ? 'p.max_cycles' : 'p.growth_steps';
 $action = $input['action'] ?? '';
 $trustedGardenActions = ['till', 'water', 'plant', 'harvest', 'dig'];
 $isTrustedGardenAction = !empty($input['trusted_client']) && in_array($action, $trustedGardenActions, true);
@@ -308,7 +309,7 @@ try {
         $cropId = (int) ($input['planted_crop_id'] ?? 0);
 
         $stmt = $db->prepare("
-            SELECT pc.*, p.growth_steps, p.harvest_item_id, p.harvest_min, p.harvest_max, p.name,
+            SELECT pc.*, {$plantCyclesSelect} AS growth_steps, p.harvest_item_id, p.harvest_min, p.harvest_max, p.name,
                    COALESCE(problem_counts.weed_count, 0) AS weed_count
             FROM planted_crops pc
             JOIN plants p ON p.plant_id = pc.plant_id
@@ -1077,7 +1078,7 @@ try {
             $stmt = $db->prepare("UPDATE player_state SET reputation = GREATEST(0, reputation - ?) WHERE user_id=?");
             $stmt->bind_param('ii', $penalty, $userId); $stmt->execute();
         }
-        $stmt = $db->prepare("UPDATE player_orders SET order_status='cancelled', is_expired=1 WHERE player_order_id=? AND user_id=?");
+        $stmt = $db->prepare("DELETE FROM player_orders WHERE player_order_id=? AND user_id=?");
         $stmt->bind_param('ii', $orderId, $userId); $stmt->execute();
         $db->commit();
         jsonResponse(['ok'=>true,'message'=>'Order cancelled. -'.$penalty.' reputation.', 'reputation_delta'=>-$penalty]);
