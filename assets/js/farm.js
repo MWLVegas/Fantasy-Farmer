@@ -1,4 +1,4 @@
-console.info('Fantasy Farmer JS loaded: v0.4.34');
+console.info('Fairytale Farm JS Loaded');
 
 let state = null;
 let canvas = null;
@@ -33,8 +33,16 @@ let mapMarkerScales = {};
 let loadedAppVersion = null;
 let versionMismatchShown = false;
 let latestServerVersion = null;
+let allItemsRefreshScheduled = false; // one-shot re-fetch when all_items is missing
 let shedEditMode = false;
 let shedDrag = null;
+let activeGardenId = null;
+const gardenStateCache = new Map(); // garden_id → snapshot of garden-specific state fields
+let gardenTabHits = [];
+let mapBgCurrent = '';
+let mapBgPrev = '';
+let mapBgTransitionAt = 0;
+const MAP_BG_TRANSITION_MS = 2500;
 let savePendingCount = 0;
 let saveStatusTimer = null;
 let audioUnlocked = false;
@@ -51,6 +59,7 @@ let marketWandererSeed = '';
 let panelBackgroundImage = '';
 let panelBackgroundPrevImage = '';
 let panelBackgroundTransitionStartedAt = 0;
+let machineModalTimer = null;
 const LOCATION_BACKGROUND_TRANSITION_MS = 1000;
 const STATE_BACKGROUND_TRANSITION_MS = 2100;
 let panelBackgroundScreen = '';
@@ -74,6 +83,19 @@ const RUSH_ICON = '⚡';
 
 const $ = (selector) => document.querySelector(selector);
 
+const INITIAL_LOADING_IMAGE = 'assets/map/map_day.png';
+let initialLoadingImage = null;
+let initialLoadingImageStarted = false;
+
+function preloadInitialLoadingImage() {
+  if (initialLoadingImageStarted) return;
+  initialLoadingImageStarted = true;
+
+  initialLoadingImage = new Image();
+  initialLoadingImage.src = assetUrl(INITIAL_LOADING_IMAGE);
+}
+
+preloadInitialLoadingImage();
 
 function systemIcon(code, fallback = '') {
   const icons = state?.system_icons || {};
@@ -97,7 +119,7 @@ function mapIcon() {
 }
 
 function backpackIcon() {
-  return systemIcon('nav_backpack', systemIcon('global_backpack', '🎒'));
+  return systemIcon('global_backpack', '🎒');
 }
 
 function ordersIcon() {
@@ -173,6 +195,7 @@ function assetUrl(path) {
 }
 
 function cssImageUrl(path) {
+  if (!path || !isImageIcon(path)) return 'none';
   const url = assetUrl(path);
   return url ? `url("${String(url).replace(/\"/g, '%22')}")` : 'none';
 }
@@ -425,7 +448,8 @@ async function fetchState(options = {}) {
     recognition: Number(state.progress?.recognition ?? state.user?.recognition ?? 0)
   } : null;
 
-  const res = await fetch('api/state.php', { cache: 'no-store' });
+  const gardenParam = activeGardenId ? `?garden_id=${encodeURIComponent(activeGardenId)}` : '';
+  const res = await fetch(`api/state.php${gardenParam}`, { cache: 'no-store' });
   if (res.status === 401) {
     window.location.href = 'login.php';
     return;
@@ -445,7 +469,7 @@ async function fetchState(options = {}) {
   }
 
   if (!loadedAppVersion) {
-    loadedAppVersion = data.version || window.GAME_VERSION || 'v0.4.16';
+    loadedAppVersion = data.version || window.GAME_VERSION || 'v???';
   } else if (data.version && data.version !== loadedAppVersion) {
     versionMismatchShown = true;
     latestServerVersion = data.version;
@@ -453,6 +477,33 @@ async function fetchState(options = {}) {
   }
 
   state = data;
+  _ornamentalGridKey = null; // fresh data → always redraw grid on next render
+
+  // If all_items is absent the API has been updated but this session predates it.
+  // Do one silent re-fetch so item icons are available immediately without a manual reload.
+  if (!state.all_items && !allItemsRefreshScheduled) {
+    allItemsRefreshScheduled = true;
+    setTimeout(() => fetchState({ force: true }), 200);
+  }
+
+  if (!activeGardenId && data.garden?.garden_id) {
+    activeGardenId = Number(data.garden.garden_id);
+  }
+
+  // Cache the full garden-specific payload so switching back is instant
+  if (data.garden?.garden_id) {
+    gardenStateCache.set(Number(data.garden.garden_id), {
+      garden:               data.garden,
+      plots:                data.plots,
+      crops:                data.crops,
+      pot_placements:       data.pot_placements,
+      ornamental_pot_types: data.ornamental_pot_types,
+      tools:                data.tools,
+      plants:               data.plants,
+      pouch:                data.pouch,
+      relic_pickup:         data.relic_pickup,
+    });
+  }
 
   const nextProgress = {
     reputation: Number(data.progress?.reputation ?? data.user?.reputation ?? 0),
@@ -480,7 +531,9 @@ async function fetchState(options = {}) {
 
   preloadLikelyBackgroundAssets();
   render();
+  hideInitialCanvasLoader();
   maybeOpenStoryEvent();
+  
 }
 
 function scheduleSoftGardenRefresh(delay = 4500) {
@@ -796,6 +849,67 @@ function getTileFromEvent(evt) {
   ) || null;
 }
 
+function canvasPointToScreenPoint(point) {
+  if (!canvas || !point) return { x: 0, y: 0 };
+
+  const rect = canvas.getBoundingClientRect();
+  const sx = rect.width / canvasLogicalWidth();
+  const sy = rect.height / canvasLogicalHeight();
+
+  return {
+    x: rect.left + Number(point.x || 0) * sx,
+    y: rect.top + Number(point.y || 0) * sy
+  };
+}
+
+function collectPouchFromCanvas(pointer = null) {
+  if (!state?.pouch) return;
+
+  const pouch = state.pouch;
+  const pouchId = Number(pouch.pouch_id || 0);
+  if (!pouchId) return;
+
+  const pouchType = pouch.pouch_type || 'seed';
+  const logicalPoint = pointer || pouchPosition() || { x: canvasLogicalWidth() / 2, y: canvasLogicalHeight() / 2 };
+  const screenPoint = canvasPointToScreenPoint(logicalPoint);
+
+  const flyIcon = pouchType === 'fae_offering'
+    ? '✨'
+    : (state.clock?.pouch_icon || '👝');
+
+  const flyQty = Number(pouch.seed_count || 1);
+
+  // Client-first: remove it now. The database can catch up like a responsible adult.
+  state.pouch = null;
+  render();
+
+  flyOfferingToInventory(flyIcon, screenPoint.x, screenPoint.y, flyQty);
+
+  doAction(
+    {
+      action: 'collect_pouch',
+      pouch_id: pouchId
+    },
+    null,
+    {
+      silent: true,
+      trustClient: false
+    }
+  ).then(data => {
+    if (data?.ok) {
+      showStatus(data.message || 'Pouch collected.');
+      fetchState({ force: true });
+      return;
+    }
+
+    // If the server rejects it, reconcile quickly.
+    fetchState({ force: true });
+  }).catch(() => {
+    showStatus('Could not collect that pouch.', true);
+    fetchState({ force: true });
+  });
+}
+
 function pouchPosition() {
   if (!state?.pouch) return null;
   return {
@@ -811,6 +925,70 @@ function pouchHit(pointer) {
   const dx = pointer.x - pos.x;
   const dy = pointer.y - pos.y;
   return Math.sqrt(dx * dx + dy * dy) <= 38;
+}
+
+function canvasPointToScreenPoint(point) {
+  if (!canvas || !point) return { x: 0, y: 0 };
+
+  const rect = canvas.getBoundingClientRect();
+  const sx = rect.width / canvasLogicalWidth();
+  const sy = rect.height / canvasLogicalHeight();
+
+  return {
+    x: rect.left + Number(point.x || 0) * sx,
+    y: rect.top + Number(point.y || 0) * sy
+  };
+}
+
+function collectPouchFromCanvas(pointer = null) {
+  if (!state?.pouch) return;
+
+  const pouch = state.pouch;
+  const pouchId = Number(pouch.pouch_id || 0);
+  if (!pouchId) return;
+
+  const pouchType = pouch.pouch_type || 'seed';
+  const logicalPoint = pointer || pouchPosition() || {
+    x: canvasLogicalWidth() / 2,
+    y: canvasLogicalHeight() / 2
+  };
+
+  const screenPoint = canvasPointToScreenPoint(logicalPoint);
+
+  // Fly the pouch itself, not the mystery contents.
+  // Contents are server-decided, so we do not fake +seed icons here.
+  const flyIcon = pouchType === 'fae_offering'
+    ? '✨'
+    : (state.clock?.pouch_icon || '👝');
+
+  // Client-first: remove pouch immediately.
+  state.pouch = null;
+  render();
+
+  flyOfferingToInventory(flyIcon, screenPoint.x, screenPoint.y, null);
+
+  doAction(
+    {
+      action: 'collect_pouch',
+      pouch_id: pouchId
+    },
+    null,
+    {
+      silent: true,
+      trustClient: false
+    }
+  ).then(data => {
+    if (data?.ok) {
+      showStatus(data.message || 'Pouch collected.');
+      fetchState({ force: true });
+      return;
+    }
+
+    fetchState({ force: true });
+  }).catch(() => {
+    showStatus('Could not collect that pouch.', true);
+    fetchState({ force: true });
+  });
 }
 
 function relicPosition() {
@@ -865,7 +1043,10 @@ function handleCanvasMove(evt) {
 
   if (pouchHit(pointerCanvasPos)) {
     stopRepeat();
-    showTooltipHtml('<b>Pick up pouch</b><br><span class="muted-line">Click to open it.</span>', evt);
+    const pouchTip = state?.pouch?.pouch_type === 'fae_offering'
+      ? '<b>Fae Offering</b><br><span class="muted-line">The fae left something near the blooms.</span>'
+      : '<b>Seed Pouch</b><br><span class="muted-line">Click to open it.</span>';
+    showTooltipHtml(pouchTip, evt);
     return;
   }
 
@@ -886,8 +1067,15 @@ function handleCanvasClick(evt) {
   setPointerFromEvent(evt);
 
   const tab = currentTabName();
+
   if (tab !== 'garden') {
-    const hit = canvasSceneHits.find(h => pointerCanvasPos.x >= h.x && pointerCanvasPos.x <= h.x + h.w && pointerCanvasPos.y >= h.y && pointerCanvasPos.y <= h.y + h.h);
+    const hit = canvasSceneHits.find(h =>
+      pointerCanvasPos.x >= h.x &&
+      pointerCanvasPos.x <= h.x + h.w &&
+      pointerCanvasPos.y >= h.y &&
+      pointerCanvasPos.y <= h.y + h.h
+    );
+
     if (hit?.action) return hit.action();
     return;
   }
@@ -896,16 +1084,348 @@ function handleCanvasClick(evt) {
     return openRelicFoundModal(state.relic_pickup);
   }
 
+  // Fae-offering and seed pouches — checked before the ornamental intercept.
+  // In ornamental, seed-type pouches are hidden and unclickable.
   if (pouchHit(pointerCanvasPos)) {
-    return doAction({ action: 'collect_pouch', pouch_id: Number(state.pouch.pouch_id) }, { kind: 'pouch', x: pointerCanvasPos.x, y: pointerCanvasPos.y });
+    const pouchType = state?.pouch?.pouch_type || 'seed';
+    const isOrnamental = state?.garden?.garden_type_code === 'ornamental';
+
+    if (!(isOrnamental && pouchType !== 'fae_offering')) {
+      return collectPouchFromCanvas(pointerCanvasPos);
+    }
+  }
+
+  // Ornamental garden uses pot slots, not tile grid.
+  if (state?.garden?.garden_type_code === 'ornamental') {
+    const slot = getPotSlotFromEvent(evt);
+    performOrnamentalAction(slot, pointerCanvasPos);
+    return;
   }
 
   const hit = getTileFromEvent(evt);
   if (hit) performTileAction(hit, pointerCanvasPos);
 }
 
+function performTileAction(hit, pointerPos = null, repeating = false) {
+  if (!state) return;
+
+  const plot = getPlot(hit.gridX, hit.gridY);
+  if (!plot) return;
+
+  if (!Number(plot.is_unlocked)) {
+    if (inventoryItemByCode('land_claim_note')) return confirmUnlockPlot(plot);
+    if (selectedMode.type === 'info') return openPlotInfoModal(plot, null);
+    return showStatus('Locked plot. Needs a Land Claim Note.', true);
+  }
+
+  const crop = cropAt(hit.gridX, hit.gridY);
+
+  if (selectedMode.type === 'info') {
+    return openPlotInfoModal(plot, crop);
+  }
+
+  const fxPoint = {
+    x: pointerPos?.x ?? hit.cx,
+    y: pointerPos?.y ?? hit.cy
+  };
+
+  if (selectedMode.type === 'tool') {
+    const now = performance.now();
+    if (now - lastToolUseAt < 300) return;
+    lastToolUseAt = now;
+  }
+
+  if (selectedMode.type === 'tool' && selectedMode.value === 'hoe') {
+    plot.till_progress = Math.min(
+      100,
+      Number(plot.till_progress || 0) + Number(getTool('hoe')?.strength || 25)
+    );
+
+    plot.is_tilled = Number(plot.till_progress) >= 100 ? 1 : plot.is_tilled;
+
+    render();
+
+    doAction(
+      {
+        action: 'till',
+        plot_id: Number(plot.plot_id),
+        till_progress: Number(plot.till_progress || 0),
+        is_tilled: Number(plot.is_tilled || 0)
+      },
+      { kind: 'till', ...fxPoint },
+      {
+        silent: repeating,
+        trustClient: false
+      }
+    );
+
+    return;
+  }
+
+  if (selectedMode.type === 'tool' && selectedMode.value === 'watering_can') {
+    if (!crop) return showStatus('Nothing to water.', true);
+    if (cropIsMature(crop)) return showStatus('Fully grown crops do not need water.', true);
+    if (cropHasProblems(crop)) return showStatus('Clear pests or weeds first.', true);
+
+    crop.water_current = Math.min(
+      Number(crop.water_max || 100),
+      Number(crop.water_current || 0) + Number(getTool('watering_can')?.strength || 15)
+    );
+
+    render();
+
+    doAction(
+      {
+        action: 'water',
+        planted_crop_id: Number(crop.planted_crop_id),
+        water_current: Number(crop.water_current || 0),
+        garden_id: Number(state.garden?.garden_id || crop.garden_id || 0),
+        origin_x: Number(crop.origin_x || 0),
+        origin_y: Number(crop.origin_y || 0)
+      },
+      { kind: 'water', ...fxPoint },
+      { silent: repeating }
+    );
+
+    return;
+  }
+
+  if (selectedMode.type === 'tool' && selectedMode.value === 'shovel') {
+    if (!crop) return showStatus('Nothing to dig.', true);
+
+    const cropId = Number(crop.planted_crop_id);
+
+    state.crops = (state.crops || []).filter(
+      c => String(c.planted_crop_id) !== String(crop.planted_crop_id)
+    );
+
+    state.crop_problems = (state.crop_problems || []).filter(
+      p => String(p.planted_crop_id) !== String(crop.planted_crop_id)
+    );
+
+    for (let yy = Number(crop.origin_y || 0); yy < Number(crop.origin_y || 0) + Number(crop.height || 1); yy++) {
+      for (let xx = Number(crop.origin_x || 0); xx < Number(crop.origin_x || 0) + Number(crop.width || 1); xx++) {
+        const p = getPlot(xx, yy);
+
+        if (p) {
+          p.is_tilled = 0;
+          p.till_progress = 0;
+        }
+      }
+    }
+
+    canvasFloatFx.push({
+      icon: actionFxIcon('dig') || getTool('shovel')?.icon || '⛏️',
+      text: 'Dug up',
+      x: fxPoint.x,
+      y: fxPoint.y,
+      createdAt: performance.now()
+    });
+
+    render();
+
+    doAction(
+      {
+        action: 'dig',
+        planted_crop_id: cropId
+      },
+      { kind: 'dig', ...fxPoint },
+      {
+        silent: repeating,
+        trustClient: false
+      }
+    );
+
+    return;
+  }
+
+  if (selectedMode.type === 'seed') {
+    if (crop) return showStatus('Something is already growing there.', true);
+
+    const plant = selectedPlant();
+    if (!plant) return;
+
+    const plantW = Math.max(1, Number(plant.width || plant.grid_w || 1));
+    const plantH = Math.max(1, Number(plant.height || plant.grid_h || 1));
+
+    const seed = (state.inventory || []).find(i => Number(i.item_id) === Number(plant.seed_item_id));
+
+    if (!seed || Number(seed.quantity || 0) <= 0) {
+      return showStatus('You need seeds for that crop.', true);
+    }
+
+    for (let yy = hit.gridY; yy < hit.gridY + plantH; yy++) {
+      for (let xx = hit.gridX; xx < hit.gridX + plantW; xx++) {
+        const p = getPlot(xx, yy);
+
+        if (!p || !Number(p.is_unlocked) || !Number(p.is_tilled) || cropAt(xx, yy)) {
+          return showStatus('That crop will not fit there.', true);
+        }
+      }
+    }
+
+    seed.quantity = Math.max(0, Number(seed.quantity || 0) - 1);
+    state.inventory = (state.inventory || []).filter(i => Number(i.quantity || 0) > 0);
+
+    state.crops = state.crops || [];
+
+    const localCropId = `local-${Date.now()}-${hit.gridX}-${hit.gridY}`;
+
+    state.crops.push({
+      planted_crop_id: localCropId,
+      garden_id: Number(state.garden?.garden_id || 0),
+      plant_id: Number(plant.plant_id),
+      origin_x: Number(hit.gridX),
+      origin_y: Number(hit.gridY),
+      width: plantW,
+      height: plantH,
+      name: plant.name,
+      code: plant.code,
+      crop_image_code: plant.crop_image_code || plant.code,
+      growth_steps: Number(plant.growth_steps || 1),
+      growth_step_current: 0,
+      water_current: 0,
+      water_max: Number(plant.water_max || 100),
+      harvest_min: plant.harvest_min || '?',
+      harvest_max: plant.harvest_max || '?',
+      seed_icon: plant.seed_icon,
+      mature_icon: plant.mature_icon || plant.seed_icon,
+      has_weeds: 0,
+      has_pests: 0
+    });
+
+    canvasFloatFx.push({
+      icon: plant.seed_icon || '🌱',
+      text: 'Planted',
+      x: fxPoint.x,
+      y: fxPoint.y,
+      createdAt: performance.now()
+    });
+
+    render();
+
+    doAction(
+      {
+        action: 'plant',
+        local_planted_crop_id: localCropId,
+        garden_id: Number(state.garden.garden_id),
+        plant_id: Number(plant.plant_id),
+        x: hit.gridX,
+        y: hit.gridY
+      },
+      { kind: 'plant', ...fxPoint },
+      { silent: true }
+    );
+
+    return;
+  }
+
+  if (selectedMode.type === 'harvest') {
+    const problem = problemAtPoint(pointerPos);
+
+    if (problem) {
+      state.crop_problems = (state.crop_problems || []).filter(
+        p => Number(p.crop_problem_id) !== Number(problem.crop_problem_id)
+      );
+
+      const problemCrop = (state.crops || []).find(
+        c => String(c.planted_crop_id) === String(problem.planted_crop_id)
+      );
+
+      if (problemCrop) {
+        problemCrop.has_weeds = cropProblemsForCrop(problemCrop).some(p => p.problem_type === 'weed') ? 1 : 0;
+        problemCrop.has_pests = cropProblemsForCrop(problemCrop).some(p => p.problem_type === 'pest') ? 1 : 0;
+      }
+
+      canvasFloatFx.push({
+        icon: problem.icon || (problem.problem_type === 'pest' ? '🐛' : '🌿'),
+        text: '+1',
+        x: fxPoint.x,
+        y: fxPoint.y,
+        createdAt: performance.now()
+      });
+
+      render();
+
+      doAction(
+        {
+          action: 'harvest_crop_problem',
+          crop_problem_id: Number(problem.crop_problem_id)
+        },
+        { kind: 'harvest', ...fxPoint },
+        { silent: true }
+      );
+
+      return;
+    }
+
+    if ((state.garden?.garden_type_code || '') === 'ornamental') {
+      return showStatus('Ornamental plants do not need to be harvested.', false);
+    }
+
+    if (!crop) return showStatus('Nothing to harvest.', true);
+
+    if (Number(crop.growth_step_current || 0) < Number(crop.growth_steps || 0)) {
+      return showStatus('Not ready yet.', true);
+    }
+
+    state.crops = (state.crops || []).filter(
+      c => String(c.planted_crop_id) !== String(crop.planted_crop_id)
+    );
+
+    state.crop_problems = (state.crop_problems || []).filter(
+      p => String(p.planted_crop_id) !== String(crop.planted_crop_id)
+    );
+
+    for (let yy = Number(crop.origin_y || 0); yy < Number(crop.origin_y || 0) + Number(crop.height || 1); yy++) {
+      for (let xx = Number(crop.origin_x || 0); xx < Number(crop.origin_x || 0) + Number(crop.width || 1); xx++) {
+        const p = getPlot(xx, yy);
+
+        if (p) {
+          p.is_tilled = 0;
+          p.till_progress = 0;
+        }
+      }
+    }
+
+    canvasFloatFx.push({
+      icon: crop.mature_icon || '🌾',
+      text: 'Harvest',
+      x: fxPoint.x,
+      y: fxPoint.y,
+      createdAt: performance.now()
+    });
+
+    render();
+
+    doAction(
+      {
+        action: 'harvest',
+        planted_crop_id: Number(crop.planted_crop_id)
+      },
+      { kind: 'harvest', ...fxPoint },
+      { silent: true }
+    );
+  }
+}
+
 function startRepeat(evt) {
   if (isModalOpen() || currentTabName() !== 'garden' || selectedMode.type !== 'tool') return;
+
+  if (state?.garden?.garden_type_code === 'ornamental') {
+    // Only watering can repeats are valid in ornamental
+    if (selectedMode.value !== 'watering_can') return;
+    setPointerFromEvent(evt);
+    const slot = getPotSlotFromEvent(evt);
+    if (!slot?.placement) return;
+    isPointerDown = true;
+    performOrnamentalAction(slot, pointerCanvasPos);
+    repeatTimer = setInterval(() => {
+      if (isPointerDown) performOrnamentalAction(slot, pointerCanvasPos);
+    }, 350);
+    return;
+  }
+
   setPointerFromEvent(evt);
   hoverTile = getTileFromEvent(evt);
   if (!hoverTile || pouchHit(pointerCanvasPos) || relicHit(pointerCanvasPos)) return;
@@ -916,133 +1436,13 @@ function startRepeat(evt) {
   }, 350);
 }
 
+
 function stopRepeat() {
   isPointerDown = false;
   if (repeatTimer) clearInterval(repeatTimer);
   repeatTimer = null;
 }
 
-function performTileAction(hit, pointerPos = null, repeating = false) {
-  if (!state) return;
-  const plot = getPlot(hit.gridX, hit.gridY);
-  if (!plot) return;
-  if (!Number(plot.is_unlocked)) {
-    if (inventoryItemByCode('land_claim_note')) return confirmUnlockPlot(plot);
-    if (selectedMode.type === 'info') return openPlotInfoModal(plot, null);
-    return showStatus('Locked plot. Needs a Land Claim Note.', true);
-  }
-
-  const crop = cropAt(hit.gridX, hit.gridY);
-  if (selectedMode.type === 'info') return openPlotInfoModal(plot, crop);
-  const fxPoint = { x: pointerPos?.x ?? hit.cx, y: pointerPos?.y ?? hit.cy };
-
-  if (selectedMode.type === 'tool') {
-    const now = performance.now();
-    if (now - lastToolUseAt < 300) return;
-    lastToolUseAt = now;
-  }
-
-  if (selectedMode.type === 'tool' && selectedMode.value === 'hoe') {
-    plot.till_progress = Math.min(100, Number(plot.till_progress || 0) + Number(getTool('hoe')?.strength || 25));
-    plot.is_tilled = Number(plot.till_progress) >= 100 ? 1 : plot.is_tilled;
-    doAction({ action: 'till', plot_id: Number(plot.plot_id), till_progress: Number(plot.till_progress || 0), is_tilled: Number(plot.is_tilled || 0) }, { kind: 'till', ...fxPoint }, { silent: repeating });
-    render();
-    return;
-  }
-
-  if (selectedMode.type === 'tool' && selectedMode.value === 'watering_can') {
-    if (!crop) return showStatus('Nothing to water.', true);
-    if (cropIsMature(crop)) return showStatus('Fully grown crops do not need water.', true);
-    if (cropHasProblems(crop)) return showStatus('Clear pests or weeds first.', true);
-    crop.water_current = Math.min(Number(crop.water_max || 100), Number(crop.water_current || 0) + Number(getTool('watering_can')?.strength || 15));
-    render();
-    doAction({ action: 'water', planted_crop_id: Number(crop.planted_crop_id), water_current: Number(crop.water_current || 0), garden_id: Number(state.garden?.garden_id || crop.garden_id || 0), origin_x: Number(crop.origin_x || 0), origin_y: Number(crop.origin_y || 0) }, { kind: 'water', ...fxPoint }, { silent: repeating });
-    return;
-  }
-
-  if (selectedMode.type === 'tool' && selectedMode.value === 'shovel') {
-    if (!crop) return showStatus('Nothing to dig.', true);
-    doAction({ action: 'dig', planted_crop_id: Number(crop.planted_crop_id) }, { kind: 'dig', ...fxPoint }, { silent: repeating });
-    return;
-  }
-
-  if (selectedMode.type === 'seed') {
-    if (crop) return showStatus('Something is already growing there.', true);
-    const plant = selectedPlant();
-    if (!plant) return;
-    const seed = (state.inventory || []).find(i => Number(i.item_id) === Number(plant.seed_item_id));
-    if (!seed || Number(seed.quantity || 0) <= 0) return showStatus('You need seeds for that crop.', true);
-    for (let yy = hit.gridY; yy < hit.gridY + Number(plant.height || 1); yy++) {
-      for (let xx = hit.gridX; xx < hit.gridX + Number(plant.width || 1); xx++) {
-        const p = getPlot(xx, yy);
-        if (!p || !Number(p.is_unlocked) || !Number(p.is_tilled) || cropAt(xx, yy)) return showStatus('That crop will not fit there.', true);
-      }
-    }
-    seed.quantity = Math.max(0, Number(seed.quantity || 0) - 1);
-    state.inventory = (state.inventory || []).filter(i => Number(i.quantity || 0) > 0);
-    state.crops = state.crops || [];
-    const localCropId = `local-${Date.now()}`;
-    state.crops.push({
-      planted_crop_id: localCropId,
-      garden_id: state.garden.garden_id,
-      plant_id: plant.plant_id,
-      origin_x: hit.gridX,
-      origin_y: hit.gridY,
-      width: plant.width,
-      height: plant.height,
-      name: plant.name,
-      code: plant.code,
-      growth_steps: plant.growth_steps || 1,
-      growth_step_current: 0,
-      water_current: 0,
-      water_max: plant.water_max || 100,
-      harvest_min: plant.harvest_min || '?',
-      harvest_max: plant.harvest_max || '?',
-      seed_icon: plant.seed_icon,
-      mature_icon: plant.mature_icon || plant.seed_icon,
-      has_weeds: 0,
-      has_pests: 0
-    });
-    render();
-    doAction({
-      action: 'plant',
-      local_planted_crop_id: localCropId,
-      garden_id: Number(state.garden.garden_id),
-      plant_id: Number(selectedMode.value),
-      x: hit.gridX,
-      y: hit.gridY
-    }, { kind: 'plant', ...fxPoint }, { silent: true });
-    return;
-  }
-
-  if (selectedMode.type === 'harvest') {
-    const problem = problemAtPoint(pointerPos);
-    if (problem) {
-      state.crop_problems = (state.crop_problems || []).filter(p => Number(p.crop_problem_id) !== Number(problem.crop_problem_id));
-      const problemCrop = (state.crops || []).find(c => String(c.planted_crop_id) === String(problem.planted_crop_id));
-      if (problemCrop) {
-        problemCrop.has_weeds = cropProblemsForCrop(problemCrop).some(p => p.problem_type === 'weed') ? 1 : 0;
-        problemCrop.has_pests = cropProblemsForCrop(problemCrop).some(p => p.problem_type === 'pest') ? 1 : 0;
-      }
-      canvasFloatFx.push({ icon: problem.icon || (problem.problem_type === 'pest' ? '🐛' : '🌿'), text: '+1', x: fxPoint.x, y: fxPoint.y, createdAt: performance.now() });
-      render();
-      doAction({ action: 'harvest_crop_problem', crop_problem_id: Number(problem.crop_problem_id) }, { kind: 'harvest', ...fxPoint }, { silent: true });
-      return;
-    }
-    if (!crop) return showStatus('Nothing to harvest.', true);
-    if (Number(crop.growth_step_current || 0) < Number(crop.growth_steps || 0)) return showStatus('Not ready yet.', true);
-    state.crops = (state.crops || []).filter(c => String(c.planted_crop_id) !== String(crop.planted_crop_id));
-    for (let yy = Number(crop.origin_y || 0); yy < Number(crop.origin_y || 0) + Number(crop.height || 1); yy++) {
-      for (let xx = Number(crop.origin_x || 0); xx < Number(crop.origin_x || 0) + Number(crop.width || 1); xx++) {
-        const p = getPlot(xx, yy);
-        if (p) { p.is_tilled = 0; p.till_progress = 0; }
-      }
-    }
-    canvasFloatFx.push({ icon: crop.mature_icon || '🌾', text: 'Harvest', x: fxPoint.x, y: fxPoint.y, createdAt: performance.now() });
-    render();
-    doAction({ action: 'harvest', planted_crop_id: Number(crop.planted_crop_id) }, { kind: 'harvest', ...fxPoint }, { silent: true });
-  }
-}
 
 function runClientHelperAutomation() {
   if (!state || currentTabName() !== 'garden') return;
@@ -1333,7 +1733,7 @@ function drawRelicPickup() {
   ctx.arc(pos.x, pos.y, 26 + pulse * 8, 0, Math.PI * 2);
   ctx.fill();
   ctx.globalAlpha = 1;
-  drawIcon(state.relic_pickup.icon || '🔹', pos.x, pos.y, 38);
+  drawIcon(relicPickupIcon(state.relic_pickup), pos.x, pos.y, 38);
   ctx.restore();
 }
 
@@ -1571,9 +1971,10 @@ function drawPouch() {
   const pulse = .45 + Math.sin(performance.now() / 180) * .16;
   ctx.save();
   ctx.globalAlpha = 1;
-  ctx.shadowColor = 'rgba(255, 230, 160, .86)';
+  const isFaeOffering = state.pouch?.pouch_type === 'fae_offering';
+  ctx.shadowColor = isFaeOffering ? 'rgba(180, 140, 255, .86)' : 'rgba(255, 230, 160, .86)';
   ctx.shadowBlur = 15 + pulse * 13;
-  drawIcon(state.clock?.pouch_icon || '👝', pos.x, pos.y, 40);
+  drawIcon(isFaeOffering ? '✨' : (state.clock?.pouch_icon || '👝'), pos.x, pos.y, 40);
   ctx.restore();
 }
 
@@ -1616,11 +2017,103 @@ function drawFx() {
   }
 }
 
+function getMapLocationConfig(locationKey) {
+  const configs = state?.map_location_config || {};
+  const key = String(locationKey || '').trim();
+
+  if (!key) return null;
+
+  return configs[key] || null;
+}
+
+function itemDefinitionByCode(code) {
+  if (!code) return null;
+
+  const lists = [
+    state?.items,
+    state?.item_config,
+    state?.itemConfig,
+    state?.shop_items,
+    state?.all_items,
+    state?.inventory,   // inventory rows carry the full item definition fields
+    state?.plants,      // plants expose seed icon/price fields
+  ];
+
+  for (const list of lists) {
+    if (!list) continue;
+
+    if (Array.isArray(list)) {
+      const found = list.find(i =>
+        String(i.code || '') === String(code) ||
+        String(i.item_code || '') === String(code)
+      );
+      if (found) return found;
+      continue;
+    }
+
+    if (typeof list === 'object') {
+      if (list[code]) return list[code];
+
+      const found = Object.values(list).find(i =>
+        String(i?.code || '') === String(code) ||
+        String(i?.item_code || '') === String(code)
+      );
+      if (found) return found;
+    }
+  }
+
+  return null;
+}
+
+function relicItemCode(relic) {
+  return String(relic?.relic_key || '') === 'second_field_relic'
+    ? 'relic_second_oddity'
+    : 'relic_first_oddity';
+}
+
+function relicPickupIcon(relic) {
+  return relic?.icon || getItemIconByCode(relicItemCode(relic), '🔹');
+}
+
+
+function getItemIconByCode(itemCode, fallback = null) {
+  const item = itemDefinitionByCode(itemCode);
+  return item?.icon || fallback;
+}
+
+function getMapLocationIcon(locationKey, fallback = '❔') {
+  const config = getMapLocationConfig(locationKey);
+
+  return (
+    config?.map_icon ||
+    config?.icon ||
+    fallback
+  );
+}
+
+function getMapLocationBackground(locationKey, fallback = '') {
+  const config = getMapLocationConfig(locationKey);
+
+  return (
+    config?.background_image ||
+    config?.backgroundImage ||
+    config?.panel_background ||
+    config?.background ||
+    fallback
+  );
+}
+
 function drawCanvasSlot(x, y, w, h, options = {}) {
   ctx.save();
+
   ctx.globalAlpha = options.alpha ?? 1;
-  ctx.fillStyle = options.fill || 'rgba(255,255,255,.045)';
-  ctx.strokeStyle = options.stroke || 'rgba(255,255,255,.14)';
+
+  // warm smoky parchment fill instead of white glass
+  ctx.fillStyle = 'rgba(71, 52, 32, .84)';
+
+  // mossy-gold border instead of bright white
+  ctx.strokeStyle = 'rgba(194, 162, 92, .42)';
+
   ctx.lineWidth = options.lineWidth || 2;
   fillStrokeRound(x, y, w, h, options.radius || 18);
   ctx.restore();
@@ -1628,23 +2121,52 @@ function drawCanvasSlot(x, y, w, h, options = {}) {
 
 function drawInventoryCanvas() {
   canvasSceneHits = [];
+
   const items = state.inventory || [];
-  drawPanelBackground('🎒');
-  const cols = 5, slot = 104, gap = 14, startX = 36, startY = 92;
+  const locationKey = 'inventory';
+
+  drawPanelBackground(
+	backpackIcon(),
+	getMapLocationBackground(locationKey, 'assets/map/inventory.png')
+  );
+
+  const cols = 6;
+  const slot = 96;
+  const gap = 10;
+  const startX = 36;
+  const startY = 92;
+
   for (let i = 0; i < Math.max(items.length, 10); i++) {
     const x = startX + (i % cols) * (slot + gap);
     const y = startY + Math.floor(i / cols) * (slot + gap);
+
     drawCanvasSlot(x, y, slot, slot);
+
     const item = items[i];
     if (!item) continue;
-    drawIcon(item.icon || '❔', x + slot / 2, y + slot / 2 - 8, 42);
+
+    drawIcon(item.icon || '❔', x + slot / 2, y + slot / 2 - 8, 64);
+
     ctx.fillStyle = '#ffe6a0';
     ctx.font = '16px system-ui';
     ctx.textAlign = 'center';
     ctx.fillText(`×${item.quantity}`, x + slot - 24, y + 20);
+
     const canUseBell = item.code === 'fairy_bell' && !hasUnlockKey('helpers_unlocked');
-    const tooltip = `<b>${escapeHtml(item.name)}</b><br><span class="muted-line">Quantity ${escapeHtml(item.quantity)}</span>${canUseBell ? '<br><span class="muted-line">Click to ring it.</span>' : ''}`;
-    canvasSceneHits.push({ x, y, w: slot, h: slot, tooltip, action: canUseBell ? openFairyBellModal : null });
+
+    const tooltip =
+      `<b>${escapeHtml(item.name)}</b>` +
+      `<br><span class="muted-line">Quantity ${escapeHtml(item.quantity)}</span>` +
+      `${canUseBell ? '<br><span class="muted-line">Click to ring it.</span>' : ''}`;
+
+    canvasSceneHits.push({
+      x,
+      y,
+      w: slot,
+      h: slot,
+      tooltip,
+      action: canUseBell ? openFairyBellModal : null
+    });
   }
 }
 
@@ -1664,6 +2186,7 @@ function switchScreen(tab) {
   canvasHoverHitStartedAt = 0;
   if (tab !== 'helpers') helperCanvasScroll = 0;
   activeScreen = tab;
+  document.body.dataset.screen = tab; // CSS gate for screen-specific UI
   preloadAssetsForScreen(tab);
   triggerScreenTransition();
   updateScreenSurfaceVisibility();
@@ -1672,6 +2195,10 @@ function switchScreen(tab) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.dataset.panel === tab));
   const backBtn = $('#backToMapBtn');
   if (backBtn) { backBtn.hidden = tab === 'map'; backBtn.innerHTML = `${renderIcon(mapIcon(), 'button-inline-icon')} Map`; backBtn.dataset.tooltipHtml = MAP_TOOLTIP; }
+  const gardenTabBar = $('#gardenTabsBar');
+  if (gardenTabBar && tab !== 'garden') gardenTabBar.hidden = true;
+  const ornOverlay = document.getElementById('ornamentalOverlay');
+  if (ornOverlay && tab !== 'garden') ornOverlay.hidden = true;
   const sideBackBtn = document.querySelector('[data-side-map-button]');
   if (sideBackBtn) { sideBackBtn.hidden = tab === 'map'; sideBackBtn.innerHTML = `${renderIcon(mapIcon(), 'button-inline-icon')} Map`; sideBackBtn.dataset.tooltipHtml = MAP_TOOLTIP; }
   updateCanvasCursor();
@@ -1679,54 +2206,8 @@ function switchScreen(tab) {
   render();
 }
 
-function getMapButtonPositions() {
-  const defaults = {
-    garden: [canvasLogicalWidth() / 2 - 62, canvasLogicalHeight() / 2 - 62],
-    shop: [110, canvasLogicalHeight() / 2 - 70],
-    orders: [canvasLogicalWidth() / 2 - 62, 105],
-    shed: [canvasLogicalWidth() - 235, canvasLogicalHeight() / 2 - 70],
-    market: [canvasLogicalWidth() / 2 - 62, 500],
-    caravan: [canvasLogicalWidth() - 250, 510],
-    bone_brine: [90, 510],
-    helpers: [canvasLogicalWidth() - 245, 125]
-  };
 
-  const markers = state?.map_config?.location_markers || {};
-  for (const [key, marker] of Object.entries(markers)) {
-    if (marker && Number.isFinite(Number(marker.x)) && Number.isFinite(Number(marker.y))) {
-      defaults[key] = [Number(marker.x), Number(marker.y)];
-    }
-  }
 
-  let custom = {};
-  const raw = state?.map_config?.button_positions_json || '';
-  if (raw) {
-    try { custom = JSON.parse(raw); } catch { custom = {}; }
-  }
-
-  for (const [key, value] of Object.entries(custom || {})) {
-    if (Array.isArray(value) && value.length >= 2) {
-      defaults[key] = [Number(value[0]), Number(value[1])];
-      continue;
-    }
-    if (value && typeof value === 'object') {
-      if (Number.isFinite(Number(value.x)) && Number.isFinite(Number(value.y))) defaults[key] = [Number(value.x), Number(value.y)];
-      if (Number.isFinite(Number(value.center_x)) && Number.isFinite(Number(value.center_y))) defaults[key] = [Number(value.center_x) - 62, Number(value.center_y) - 62];
-    }
-  }
-  return defaults;
-}
-
-function mapMarkerAliasesForKey(key) {
-  const aliases = {
-    shop: ['shop', 'store', 'general_store'],
-    helpers: ['helpers', 'forest_folk'],
-    market: ['market', 'fae_market'],
-    bone_brine: ['bone_brine', 'bone_brine_shop'],
-    shed: ['shed', 'workroom']
-  };
-  return aliases[key] || [key];
-}
 
 function markerBackgroundAssets(marker = {}) {
   if (!marker || typeof marker !== 'object') return [];
@@ -1824,64 +2305,34 @@ function preloadLikelyBackgroundAssets() {
   preloadAssetsForScreen(currentTabName());
 }
 
-function configuredMapMarkerForKey(key) {
-  const markers = state?.map_config?.location_markers || {};
-  for (const markerKey of mapMarkerAliasesForKey(key)) {
-    if (markers[markerKey]) return markers[markerKey];
-  }
-  return {};
-}
 
-function fallbackMapIconForKey(key) {
-  const fallbackIcons = {
-    garden: 'assets/map/garden.png',
-    shop: 'assets/map/store.png',
-    orders: 'assets/map/orders.png',
-    shed: 'assets/map/shed.png',
-    market: 'assets/map/market.png',
-    caravan: 'assets/map/caravan_empty.png',
-    bone_brine: 'assets/map/bone_brine.png',
-    helpers: 'assets/map/fairy_folk.png'
-  };
-  return fallbackIcons[key] || `assets/map/${key}.png`;
-}
 
-function mapMarkerForLocation(loc) {
-  const marker = configuredMapMarkerForKey(loc.key);
-  const configuredIcon = marker.icon || '';
-  const dynamicIcon = loc.key === 'caravan'
-    ? (isCaravanActive() ? (marker.active_map_icon || loc.icon) : (marker.inactive_map_icon || loc.icon))
-    : loc.icon;
-  const icon = dynamicIcon || configuredIcon || fallbackMapIconForKey(loc.key) || '❔';
-  return {
-    icon,
-    size: Number(marker.size || marker.icon_size || 78),
-    glowColor: isDayPhaseNow() ? (marker.glow_color || 'rgba(255, 214, 94, .78)') : 'rgba(164, 132, 255, .82)'
-  };
-}
 
-function drawMapMarkerIcon(icon, x, y, size, locked = false) {
+function drawMapBgLayer(src, alpha) {
+  if (!src || !isImageIcon(src)) return;
+  let img = imageCache[src];
+  if (!img) { preloadImageAsset(src); img = imageCache[src]; }
+  if (!img?.complete || !img.naturalWidth || img.failed) return;
   ctx.save();
-  if (locked && isImageIcon(icon)) {
-    ctx.filter = 'brightness(0) saturate(100%)';
-    ctx.globalAlpha = .9;
-  } else if (!isDayPhaseNow() && isImageIcon(icon)) {
-    ctx.filter = 'brightness(.82) saturate(1.08) hue-rotate(18deg)';
-  } else if (locked) {
-    ctx.globalAlpha = .35;
-    icon = '?';
-  }
-  if (icon && isImageIcon(icon) && !imageCache[icon]) preloadImageAsset(icon);
-  if (icon && isImageIcon(icon) && imageCache[icon]?.failed) icon = '🗺️';
-  drawIcon(icon, x, y, size);
+  roundedPath(10, 10, canvasLogicalWidth() - 20, canvasLogicalHeight() - 20, 22);
+  ctx.clip();
+  const scale = Math.max((canvasLogicalWidth() - 20) / img.naturalWidth, (canvasLogicalHeight() - 20) / img.naturalHeight);
+  const iw = img.naturalWidth * scale, ih = img.naturalHeight * scale;
+  ctx.globalAlpha = .82 * alpha;
+  ctx.drawImage(img, 10 + ((canvasLogicalWidth() - 20) - iw) / 2, 10 + ((canvasLogicalHeight() - 20) - ih) / 2, iw, ih);
+  ctx.globalAlpha = .38 * alpha;
+  ctx.fillStyle = '#120f0b';
+  ctx.fillRect(10, 10, canvasLogicalWidth() - 20, canvasLogicalHeight() - 20);
   ctx.restore();
 }
 
 function drawMapBackground() {
-  const bg = mapBackgroundForNow();
-  if (!bg || !isImageIcon(bg)) {
-    drawPanelBackground('🗺️');
-    return;
+  const bg = mapBackgroundForNow() || '';
+
+  if (bg !== mapBgCurrent) {
+    mapBgPrev = mapBgCurrent;
+    mapBgCurrent = bg;
+    mapBgTransitionAt = performance.now();
   }
 
   ctx.save();
@@ -1890,28 +2341,19 @@ function drawMapBackground() {
   ctx.lineWidth = 2;
   fillStrokeRound(8, 8, canvasLogicalWidth() - 16, canvasLogicalHeight() - 16, 24);
 
-  let img = imageCache[bg];
-  if (!img) {
-    preloadImageAsset(bg);
-    img = imageCache[bg];
+  if (!bg || !isImageIcon(bg)) {
+    drawIcon('🗺️', 52, 46, 38);
+    ctx.restore();
+    return;
   }
 
-  if (img?.complete && img.naturalWidth && !img.failed) {
-    ctx.save();
-    roundedPath(10, 10, canvasLogicalWidth() - 20, canvasLogicalHeight() - 20, 22);
-    ctx.clip();
-    const scale = Math.max((canvasLogicalWidth() - 20) / img.naturalWidth, (canvasLogicalHeight() - 20) / img.naturalHeight);
-    const w = img.naturalWidth * scale;
-    const h = img.naturalHeight * scale;
-    ctx.globalAlpha = .82;
-    ctx.drawImage(img, 10 + ((canvasLogicalWidth() - 20) - w) / 2, 10 + ((canvasLogicalHeight() - 20) - h) / 2, w, h);
-    ctx.globalAlpha = .38;
-    ctx.fillStyle = '#120f0b';
-    ctx.fillRect(10, 10, canvasLogicalWidth() - 20, canvasLogicalHeight() - 20);
-    ctx.restore();
-  } else {
-    drawIcon('🗺️', 52, 46, 38);
-  }
+  const elapsed = performance.now() - mapBgTransitionAt;
+  const alpha = mapBgPrev ? Math.min(1, elapsed / MAP_BG_TRANSITION_MS) : 1;
+
+  if (mapBgPrev && alpha < 1) drawMapBgLayer(mapBgPrev, 1);
+  drawMapBgLayer(mapBgCurrent, alpha);
+  if (alpha >= 1) mapBgPrev = '';
+
   ctx.restore();
 }
 
@@ -1985,13 +2427,199 @@ function drawQuestMarker(cx, cy, evt) {
   ctx.restore();
 }
 
+function mapMarkerAliasesForKey(key) {
+  const aliases = {
+    shop: ['shop', 'store', 'general_store'],
+    helpers: ['helpers', 'forest_folk'],
+    market: ['market', 'fae_market'],
+    bone_brine: ['bone_brine', 'bone_brine_shop'],
+    shed: ['shed', 'workroom'],
+    caravan: ['caravan', 'caravan_camp'],
+    orders: ['orders', 'order_board']
+  };
+
+  return aliases[key] || [key];
+}
+
+
+function getMapButtonPositions() {
+  // These are legacy fallback positions.
+  // They are TOP-LEFT marker-box positions, not center positions.
+  // Database map_x/map_y should NOT be handled here anymore.
+  const defaults = {
+    garden: [canvasLogicalWidth() / 2 - 62, canvasLogicalHeight() / 2 - 62],
+    shop: [110, canvasLogicalHeight() / 2 - 70],
+    orders: [canvasLogicalWidth() / 2 - 62, 105],
+    shed: [canvasLogicalWidth() - 235, canvasLogicalHeight() / 2 - 70],
+    market: [canvasLogicalWidth() / 2 - 62, 500],
+    caravan: [canvasLogicalWidth() - 250, 510],
+    bone_brine: [90, 510],
+    helpers: [canvasLogicalWidth() - 245, 125]
+  };
+
+  let custom = {};
+  const raw = state?.map_config?.button_positions_json || '';
+
+  if (raw) {
+    try {
+      custom = JSON.parse(raw);
+    } catch {
+      custom = {};
+    }
+  }
+
+  for (const [key, value] of Object.entries(custom || {})) {
+    if (Array.isArray(value) && value.length >= 2) {
+      defaults[key] = [Number(value[0]), Number(value[1])];
+      continue;
+    }
+
+    if (value && typeof value === 'object') {
+      if (Number.isFinite(Number(value.x)) && Number.isFinite(Number(value.y))) {
+        defaults[key] = [Number(value.x), Number(value.y)];
+      }
+
+      if (Number.isFinite(Number(value.center_x)) && Number.isFinite(Number(value.center_y))) {
+        defaults[key] = [Number(value.center_x) - 62, Number(value.center_y) - 62];
+      }
+    }
+  }
+
+  return defaults;
+}
+
+
+function configuredMapMarkerForKey(key) {
+  const markers = state?.map_config?.location_markers || {};
+
+  for (const markerKey of mapMarkerAliasesForKey(key)) {
+    if (markers[markerKey]) return markers[markerKey];
+  }
+
+  return {};
+}
+
+function fallbackMapIconForKey(key) {
+  const fallbackIcons = {
+    garden: 'assets/map/garden.png',
+    shop: 'assets/map/store.png',
+    orders: 'assets/map/orders.png',
+    shed: 'assets/map/shed.png',
+    market: 'assets/map/market.png',
+    caravan: 'assets/map/caravan_empty.png',
+    bone_brine: 'assets/map/bone_brine.png',
+    helpers: 'assets/map/fairy_folk.png'
+  };
+
+  return fallbackIcons[key] || `assets/map/${key}.png`;
+}
+
+function numericOrNull(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function mapMarkerPositionForLocation(loc) {
+  const config = getMapLocationConfig(loc.key);
+
+  const x = numericOrNull(config?.map_x);
+  const y = numericOrNull(config?.map_y);
+
+  if (x === null || y === null) {
+    console.warn('Missing map_location_config.map_x/map_y for map location:', {
+      location_key: loc?.key,
+      available_map_location_config_keys: Object.keys(state?.map_location_config || {}),
+      map_location_config_row: config
+    });
+
+    return null;
+  }
+
+  return { x, y };
+}
+
+function mapMarkerForLocation(loc) {
+  const marker = configuredMapMarkerForKey(loc.key);
+  const config = getMapLocationConfig(loc.key);
+
+  const configuredIcon =
+    config?.map_icon ||
+    marker.map_icon ||
+    marker.icon ||
+    '';
+
+  const dynamicIcon = loc.key === 'caravan'
+    ? (
+        isCaravanActive()
+          ? (marker.active_map_icon || marker.active_icon || configuredIcon || loc.icon)
+          : (marker.inactive_map_icon || marker.inactive_icon || configuredIcon || loc.icon)
+      )
+    : (
+        configuredIcon ||
+        loc.icon
+      );
+
+  const icon =
+    dynamicIcon ||
+    fallbackMapIconForKey(loc.key) ||
+    '❔';
+
+  return {
+    icon,
+    size: Math.max(
+      28,
+      Number(
+        config?.icon_size ||
+        config?.map_icon_size ||
+        marker.size ||
+        marker.icon_size ||
+        marker.map_icon_size ||
+        78
+      )
+    ),
+    glowColor: isDayPhaseNow()
+      ? (config?.glow_color || marker.glow_color || 'rgba(255, 214, 94, .78)')
+      : (config?.night_glow_color || marker.night_glow_color || 'rgba(164, 132, 255, .82)')
+  };
+}
+
+function drawMapMarkerIcon(icon, x, y, size, locked = false) {
+  ctx.save();
+
+  if (locked && isImageIcon(icon)) {
+    ctx.filter = 'brightness(0) saturate(100%)';
+    ctx.globalAlpha = .9;
+  } else if (!isDayPhaseNow() && isImageIcon(icon)) {
+    ctx.filter = 'brightness(.82) saturate(1.08) hue-rotate(18deg)';
+  } else if (locked) {
+    ctx.globalAlpha = .35;
+    icon = '?';
+  }
+
+  if (icon && isImageIcon(icon) && !imageCache[icon]) {
+    preloadImageAsset(icon);
+  }
+
+  if (icon && isImageIcon(icon) && imageCache[icon]?.failed) {
+    icon = '🗺️';
+  }
+
+  drawIcon(icon, x, y, size);
+
+  ctx.restore();
+}
+
 function drawMapCanvas() {
   canvasSceneHits = [];
   drawMapBackground();
+
   const locations = state.locations || [];
-  const positions = getMapButtonPositions();
+
   if (isCtrlDown && pointerCanvasPos) {
     const pos = roundedPointerPos();
+
     ctx.save();
     ctx.font = '800 13px system-ui';
     ctx.textAlign = 'left';
@@ -2005,55 +2633,89 @@ function drawMapCanvas() {
   }
 
   for (const loc of locations) {
-    const pos = positions[loc.key];
+    const pos = mapMarkerPositionForLocation(loc);
+
+    // The ONLY source for map icon placement is:
+    // map_location_config.map_x / map_location_config.map_y
     if (!pos) continue;
-    const [x, y] = pos;
+
     const marker = mapMarkerForLocation(loc);
+
     const baseSize = Math.max(28, Number(marker.size || 78));
     const hitW = Math.max(84, baseSize + 48);
     const hitH = Math.max(86, baseSize + 42);
+
+    // map_location_config.map_x/map_y = visible icon center.
+    const cx = pos.x;
+    const cy = pos.y;
+
+    // Hitbox only. This does not move the icon.
+    const x = cx - hitW / 2;
+    const y = cy - hitH / 2;
+
     const unlocked = !!loc.unlocked;
     const disabled = !!loc.disabled;
     const actionable = unlocked && !disabled;
+
     const isHover = canvasHoverHitId === `map:${loc.key}`;
     const targetScale = isHover ? 1.14 : 1;
     const currentScale = mapMarkerScales[loc.key] ?? 1;
     const scale = currentScale + (targetScale - currentScale) * .18;
+
     mapMarkerScales[loc.key] = scale;
-    const cx = x + hitW / 2;
-    const cy = y + baseSize * .48;
-    const pulse = unlocked ? (0.5 + 0.5 * Math.sin(Date.now() / 520)) : 0;
+
+    const pulse = unlocked
+      ? (0.5 + 0.5 * Math.sin(Date.now() / 520))
+      : 0;
+
     const iconSize = (unlocked ? baseSize : baseSize * .92) * scale;
 
     ctx.save();
+
     if (actionable) {
       ctx.shadowColor = marker.glowColor || 'rgba(255, 214, 94, .78)';
       ctx.shadowBlur = 15 + pulse * 13;
     }
+
     drawMapMarkerIcon(marker.icon, cx, cy, iconSize, !unlocked);
+
     ctx.restore();
 
     const displayName = unlocked ? loc.name : '???';
-    drawMapLabel(displayName, cx, y + baseSize + 18, unlocked);
+
+    drawMapLabel(
+      displayName,
+      cx,
+      cy + baseSize / 2 + 20,
+      unlocked
+    );
 
     const locationEvent = locationEventFor(loc.key);
-    if (unlocked && locationEvent) drawQuestMarker(cx, cy, locationEvent);
+
+    if (unlocked && locationEvent) {
+      drawQuestMarker(cx, cy, locationEvent);
+    }
 
     const tooltip = unlocked
       ? `<b>${escapeHtml(loc.name)}</b><br><span class="muted-line">${escapeHtml(loc.hint || '')}</span>${locationEvent ? `<br><b>${escapeHtml(locationEvent.title || 'Event available')}</b><br><span class="muted-line">${escapeHtml(locationEvent.tooltip || 'Something needs your attention here.')}</span>` : ''}`
       : '<b>???</b><br><span class="muted-line">An unknown place. Keep building your reputation.</span>';
+
     canvasSceneHits.push({
       id: `map:${loc.key}`,
-      x: x,
-      y: y,
+      x,
+      y,
       w: hitW,
       h: hitH,
       tooltip,
-      action: actionable ? async () => { if (await startLocationEvent(loc.key)) return; switchScreen(loc.key === 'bone_brine' ? 'bone_brine' : loc.key); } : null
+      action: actionable
+        ? async () => {
+            if (await startLocationEvent(loc.key)) return;
+            switchScreen(loc.key === 'bone_brine' ? 'bone_brine' : loc.key);
+          }
+        : null
     });
   }
 }
-
 
 function shedZonesByKey() {
   const out = {};
@@ -2182,9 +2844,149 @@ function drawShedObject(obj) {
   });
 }
 
+function parseServerTimestampMs(timestamp) {
+  if (!timestamp) return 0;
+
+  const raw = String(timestamp).trim();
+  if (!raw) return 0;
+
+  // Server PHP date('Y-m-d H:i:s') timestamps are server-time strings.
+  // On this server they are effectively UTC. Without the trailing Z,
+  // JavaScript treats them as browser-local time, which adds ~7 hours
+  // for Pacific users. That is how 6-minute jam becomes 423-minute jam.
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+    return new Date(raw.replace(' ', 'T') + 'Z').getTime();
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(raw)) {
+    return new Date(raw + 'Z').getTime();
+  }
+
+  return new Date(raw).getTime();
+}
+
+function stopMachineModalTimer() {
+  if (machineModalTimer) {
+    clearInterval(machineModalTimer);
+    machineModalTimer = null;
+  }
+}
+
+function updateMachineModalTimers() {
+  const timerEls = document.querySelectorAll('[data-machine-job-finish]');
+  if (!timerEls.length) {
+    stopMachineModalTimer();
+    return;
+  }
+
+  timerEls.forEach(el => {
+    const finishMs = Number(el.dataset.machineJobFinish || 0);
+    const jobId = Number(el.dataset.machineJobId || 0);
+
+    if (!Number.isFinite(finishMs) || finishMs <= 0) {
+      el.textContent = '';
+      return;
+    }
+
+    const seconds = Math.max(0, Math.floor((finishMs - Date.now()) / 1000));
+
+    if (seconds <= 0) {
+      const row = el.closest('.machine-slot-row');
+      const actionBox = row?.querySelector('[data-machine-job-action]');
+
+      if (actionBox && jobId) {
+        actionBox.innerHTML = `<button type="button" class="small-button" data-collect-job="${jobId}">Collect</button>`;
+      } else {
+        el.textContent = 'Ready';
+      }
+
+      return;
+    }
+
+    el.textContent = `Ready in ${formatSeconds(seconds)}`;
+  });
+}
+
+function collectMachineJobFromButton(btn, options = {}) {
+  if (!btn || btn.dataset.collecting === '1') return;
+
+  const jobId = Number(btn.dataset.collectJob || 0);
+  if (!jobId) return;
+
+  const job = (state.jobs || []).find(j => Number(j.job_id) === jobId) || null;
+
+  const rect = btn.getBoundingClientRect();
+  const flyX = rect.left + rect.width / 2;
+  const flyY = rect.top + rect.height / 2;
+
+  const flyIcon = job?.output_icon || job?.icon || '🍯';
+  const flyQty = job
+    ? Number(job.output_min || job.output_max || 1) * Number(job.quantity || 1)
+    : null;
+
+  btn.dataset.collecting = '1';
+  btn.disabled = true;
+  btn.textContent = 'Collecting...';
+
+  doAction({ action: 'collect_processing', job_id: jobId }, null, { silent: true })
+    .then(data => {
+      if (!data?.ok) {
+        btn.dataset.collecting = '0';
+        btn.disabled = false;
+        btn.textContent = 'Collect';
+        return;
+      }
+
+      flyOfferingToInventory(flyIcon, flyX, flyY, flyQty);
+
+      state.jobs = (state.jobs || []).filter(j => Number(j.job_id) !== jobId);
+
+      if (typeof options.rebuild === 'function') {
+        options.rebuild();
+      } else {
+        const row = btn.closest('.machine-slot-row');
+        if (row) row.remove();
+      }
+
+      fetchState();
+    })
+    .catch(() => {
+      btn.dataset.collecting = '0';
+      btn.disabled = false;
+      btn.textContent = 'Collect';
+      showStatus('Could not collect that item.', true);
+    });
+}
+
+function startMachineModalTimer() {
+  stopMachineModalTimer();
+  updateMachineModalTimers();
+
+  machineModalTimer = setInterval(() => {
+    updateMachineModalTimers();
+
+    const content = $('#storyContent');
+
+    content?.querySelectorAll('[data-collect-job]').forEach(btn => {
+      if (btn.dataset.boundCollect === '1') return;
+
+      btn.dataset.boundCollect = '1';
+
+      btn.addEventListener('click', () => {
+        collectMachineJobFromButton(btn);
+      });
+    });
+  }, 1000);
+}
+
 function formatTimeUntil(timestamp) {
   if (!timestamp) return '';
-  const ms = new Date(String(timestamp).replace(' ', 'T')).getTime() - Date.now();
+
+  const finishMs = parseServerTimestampMs(timestamp);
+  if (!Number.isFinite(finishMs) || finishMs <= 0) return '';
+
+  const ms = finishMs - Date.now();
+
   return formatSeconds(Math.max(0, Math.floor(ms / 1000)));
 }
 
@@ -2225,58 +3027,164 @@ function drawShedStation(station) {
   });
 }
 
-function openMachineStationModal(station) {
-  const machineType = station.machine_type;
-  const qty = Number(station.owned_quantity || 0);
-  const jobs = jobsForMachineType(machineType);
-  const recipes = recipesForMachineType(machineType);
-  const busy = jobs.length;
-  const available = Math.max(0, qty - busy);
-  let body = `<p><strong>${escapeHtml(station.display_name || station.machine_name || 'Station')}</strong></p>`;
-  body += `<p class="muted-line">Owned: ${qty} · Available: ${available}/${qty}</p>`;
+function machineQueueSize(machineType) {
+  const m = (state.all_machines || []).find(m => m.machine_type === machineType);
+  const owned = (state.machines || []).find(m => m.machine_type === machineType);
+  return Math.max(1, Number(m?.queue_size || 1)) * Math.max(1, Number(owned?.quantity || 1));
+}
 
-  if (jobs.length) {
-    body += '<h3>Working</h3>';
-    for (const job of jobs) {
-      const ready = new Date(String(job.finishes_at).replace(' ', 'T')).getTime() <= Date.now();
-      body += `<div class="machine-slot-row"><span>${renderIcon(job.output_icon || '🍯', 'inline-icon')} ${escapeHtml(job.output_name || 'Output')} ×${Number(job.output_quantity || 1) * Number(job.quantity || 1)}</span><span>${ready ? '<button type="button" class="small-button" data-collect-job="'+Number(job.job_id)+'">Collect</button>' : 'Ready in ' + formatTimeUntil(job.finishes_at)}</span></div>`;
+function estimateJobFinishMs(recipe, quantity = 1) {
+  const dayLength = Number(localClockBase?.dayLength || state?.clock?.day_length_seconds || 720);
+  const cycleCount = Number(recipe.cycle_count || 1);
+  const cycleHours = Number(recipe.cycle_hours || 12);
+  const realSeconds = cycleCount * cycleHours * (dayLength / 24) * quantity;
+  return Date.now() + realSeconds * 1000;
+}
+
+function openMachineStationModal(station) {
+  stopMachineModalTimer();
+
+  const machineType = station.machine_type;
+  const ownedQty = Number(station.owned_quantity || 0);
+  const queueMax = machineQueueSize(machineType);
+
+  function buildModal() {
+    const jobs = jobsForMachineType(machineType);
+    const busy = jobs.length;
+    const queueOpen = Math.max(0, queueMax - busy);
+    const allRecipes = recipesForMachineType(machineType);
+
+    const craftable = allRecipes.filter(r =>
+      countInventoryByItemId(r.input_item_id) >= Number(r.input_quantity || 1)
+    );
+
+    let body = `<p class="muted-line">Queue: ${busy}/${queueMax} slots used</p>`;
+
+    if (jobs.length) {
+      body += '<h3>In Progress</h3>';
+
+      for (const job of jobs) {
+        const finishMs = parseServerTimestampMs(job.finishes_at);
+        const ready = finishMs <= Date.now();
+        const outQty = Number(job.output_min || job.output_max || 1) * Number(job.quantity || 1);
+        const jobId = Number(job.job_id);
+
+        body += `<div class="machine-slot-row">
+          <span>${renderIcon(job.output_icon || '🍯', 'inline-icon')} ${escapeHtml(job.output_name || 'Output')} ×${outQty}</span>
+          <span data-machine-job-action>
+            ${ready
+              ? `<button type="button" class="small-button" data-collect-job="${jobId}">Collect</button>`
+              : `<span data-machine-job-id="${jobId}" data-machine-job-finish="${finishMs}">Ready in ${formatTimeUntil(job.finishes_at)}</span>`
+            }
+          </span>
+        </div>`;
+      }
     }
+
+    if (craftable.length) {
+      body += '<h3>Start</h3>';
+
+      for (const recipe of craftable) {
+        const outRange = Number(recipe.output_min) === Number(recipe.output_max)
+          ? `×${recipe.output_min}`
+          : `×${recipe.output_min}–${recipe.output_max}`;
+
+        body += `<div class="machine-slot-row">
+          <span>${renderIcon(recipe.input_icon || '🌿', 'inline-icon')} ${escapeHtml(recipe.input_name)} ×${recipe.input_quantity}
+            → ${renderIcon(recipe.output_icon || '✨', 'inline-icon')} ${escapeHtml(recipe.output_name)} ${outRange}</span>
+          <button type="button" class="small-button" data-start-recipe="${Number(recipe.recipe_id)}"
+            ${queueOpen <= 0 ? 'disabled' : ''}>${queueOpen <= 0 ? 'Full' : 'Start'}</button>
+        </div>`;
+      }
+    } else if (allRecipes.length) {
+      body += '<p class="hint">You do not have the ingredients for any recipes right now.</p>';
+    } else {
+      body += '<p class="hint">Recipes for this station are coming soon.</p>';
+    }
+
+    return body;
   }
 
-  if (recipes.length) {
-    body += '<h3>Start</h3>';
-    for (const recipe of recipes) {
-      const owned = countInventoryByItemId(recipe.input_item_id);
-      const canStart = available > 0 && owned >= Number(recipe.input_quantity || 1);
-      body += `<div class="machine-slot-row"><span>${renderIcon(recipe.input_icon || '🌿', 'inline-icon')} ${escapeHtml(recipe.input_name)} ×${recipe.input_quantity} → ${renderIcon(recipe.output_icon || '✨', 'inline-icon')} ${escapeHtml(recipe.output_name)} ×${recipe.output_quantity}</span><button type="button" class="small-button" data-start-recipe="${Number(recipe.recipe_id)}" ${canStart ? '' : 'disabled'}>${available <= 0 ? 'Busy' : 'Start'}</button></div>`;
+  function rebuildModalBody() {
+    const bodyEl = $('#storyContent');
+
+    if (bodyEl) {
+      bodyEl.innerHTML = buildModal();
+      bindButtons();
+      startMachineModalTimer();
     }
-  } else {
-    body += '<p class="hint">Recipes for this station are coming soon.</p>';
   }
 
   openStoryModal({
     title: station.display_name || station.machine_name || 'Station',
-    body,
+    body: buildModal(),
     button: 'Done',
     closeable: true,
-    onNext: async () => closeStoryModal()
+    onNext: async () => {
+      stopMachineModalTimer();
+      closeStoryModal();
+    }
   });
 
-  const content = $('#storyContent');
-  content?.querySelectorAll('[data-start-recipe]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const recipeId = Number(btn.dataset.startRecipe);
-      const data = await doAction({ action: 'start_processing', recipe_id: recipeId, quantity: 1 }, null, { silent: true });
-      if (data?.ok) { closeStoryModal(); fetchState(); }
+  function bindButtons() {
+    const content = $('#storyContent');
+
+    content?.querySelectorAll('[data-start-recipe]').forEach(btn => {
+      if (btn.dataset.boundStart === '1') return;
+
+      btn.dataset.boundStart = '1';
+
+      btn.addEventListener('click', () => {
+        const recipeId = Number(btn.dataset.startRecipe);
+        const recipe = (state.recipes || []).find(r => Number(r.recipe_id) === recipeId);
+        if (!recipe) return;
+
+        const invItem = (state.inventory || []).find(i => Number(i.item_id) === Number(recipe.input_item_id));
+
+        if (invItem) {
+          invItem.quantity = Math.max(0, Number(invItem.quantity) - Number(recipe.input_quantity || 1));
+        }
+
+        const finishMs = estimateJobFinishMs(recipe, 1);
+        const finishesAt = new Date(finishMs).toISOString().replace('T', ' ').substring(0, 19);
+
+        state.jobs = state.jobs || [];
+
+        state.jobs.push({
+          job_id: -Date.now(),
+          machine_type: recipe.machine_type,
+          output_item_id: recipe.output_item_id,
+          output_name: recipe.output_name,
+          output_icon: recipe.output_icon,
+          output_min: recipe.output_min || recipe.output_quantity || 1,
+          output_max: recipe.output_max || recipe.output_quantity || 1,
+          quantity: 1,
+          finishes_at: finishesAt,
+          is_collected: 0
+        });
+
+        rebuildModalBody();
+
+        doAction({ action: 'start_processing', recipe_id: recipeId, quantity: 1 }, null, { silent: true })
+          .then(() => scheduleSoftGardenRefresh(1500));
+      });
     });
-  });
-  content?.querySelectorAll('[data-collect-job]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const jobId = Number(btn.dataset.collectJob);
-      const data = await doAction({ action: 'collect_processing', job_id: jobId }, null, { silent: true });
-      if (data?.ok) { closeStoryModal(); fetchState(); }
+
+    content?.querySelectorAll('[data-collect-job]').forEach(btn => {
+      if (btn.dataset.boundCollect === '1') return;
+
+      btn.dataset.boundCollect = '1';
+
+      btn.addEventListener('click', () => {
+        collectMachineJobFromButton(btn, {
+          rebuild: rebuildModalBody
+        });
+      });
     });
-  });
+  }
+
+  bindButtons();
+  startMachineModalTimer();
 }
 
 function drawShedCanvas() {
@@ -2697,65 +3605,257 @@ function drawOrderRewardCanvas(order, confirmed, x, y) {
 function weeklySpecialItems() {
   const woodenHoe = (state.all_tools || []).find(t => t.code === 'wooden_hoe');
   const ownsWoodenHoe = (state.tools || []).some(t => t.code === 'wooden_hoe');
+
   if (woodenHoe && !ownsWoodenHoe) {
-    return [{ tool: woodenHoe, icon: woodenHoe.icon, rowIcon: woodenHoe.icon, name: 'Weekly Special: Wooden Hoe', price: Number(woodenHoe.upgrade_cost || 75), action: () => buyToolFromCanvas(woodenHoe) }];
+    return [{
+      code: woodenHoe.code,
+      tool: woodenHoe,
+      icon: woodenHoe.icon,
+      rowIcon: woodenHoe.shop_row_icon || woodenHoe.icon,
+      name: 'Weekly Special: Wooden Hoe',
+      price: Number(woodenHoe.upgrade_cost || 75),
+      action: () => buyToolFromCanvas(woodenHoe)
+    }];
   }
-  const deed = (state.inventory || []).find(i => i.code === 'land_claim_note') || { code: 'land_claim_note', icon: '📜', name: 'Land Claim Note', base_buy_price: 175, quantity: 0 };
+
+  const deedDefinition = itemDefinitionByCode('land_claim_note');
+  const deedInventory  = inventoryItemByCode('land_claim_note');
+
+  // Icons and display data always come from the item definition (state.all_items),
+  // with the inventory copy as a secondary source. No hardcoded fallback icons.
+  const icon     = deedDefinition?.icon         || deedInventory?.icon         || null;
+  const rowIcon  = deedDefinition?.shop_row_icon || deedInventory?.shop_row_icon || icon;
+  const deedName = deedDefinition?.name         || deedInventory?.name         || 'Land Claim Note';
+  const itemId   = deedDefinition?.item_id      || deedInventory?.item_id;
+
   const purchased = Number(state.land_claim_shop_purchases || 0);
   if (purchased >= 3) return [];
-  const price = Number(deed.base_buy_price || 175) + (purchased * 75);
-  return [{ icon: deed.icon || '📜', rowIcon: deed.shop_row_icon || deed.icon || '📜', name: `Special: Land Claim Note (${3 - purchased} left at shop)`, price, action: () => buySpecialItemFromCanvas('land_claim_note', { ...deed, base_buy_price: price }) }];
+
+  // Price is always derived from the canonical definition base price, never the
+  // inventory copy (which stores the price paid at purchase time and would skew
+  // the formula on subsequent purchases).
+  const basePrice = Number(deedDefinition?.base_buy_price || 175);
+  const price     = basePrice + (purchased * 75);
+
+  // Build a merged deed object only for passing to buySpecialItemFromCanvas
+  const deed = {
+    code: 'land_claim_note',
+    name: deedName,
+    item_type: deedDefinition?.item_type || deedInventory?.item_type || 'material',
+    base_sell_price: Number(deedDefinition?.base_sell_price || 0),
+    item_id: itemId,
+    icon,
+    shop_row_icon: rowIcon,
+  };
+
+  return [{
+    code: 'land_claim_note',
+    item: deed,
+    icon,
+    rowIcon,
+    name: `Special: ${deedName} (${3 - purchased} left at shop)`,
+    price,
+    action: () => buySpecialItemFromCanvas('land_claim_note', { ...deed, base_buy_price: price })
+  }];
 }
+
+let shopHintIndex = 0;
+let shopHintLastChanged = 0;
+let shopHintAlpha = 1;
 
 function drawShopCanvas() {
   canvasSceneHits = [];
+
   const hideSecretNight = !hasUnlockKey('location_market');
   const shopIcon = locationIconFor('shop', '🏪', ['store', 'general_store']);
-  drawPanelBackground(shopIcon, locationBackgroundForNow('shop', ['store', 'general_store'], { forceDay: hideSecretNight }));
-  const rows = [
-    { title: '🌱', y: 58, items: (state.plants || []).map(p => ({ plant: p, icon: p.seed_icon, rowIcon: p.seed_shop_row_icon || p.seed_icon, name: p.seed_name || p.name, price: Number(p.base_buy_price || 0), action: () => buySeedFromCanvas(p) })) },
-    { title: '🛠️', y: 248, items: (state.all_machines || []).map(m => ({ machine: m, icon: m.icon, rowIcon: m.icon, name: m.name, price: Number(m.base_cost || 0), action: () => buyMachineFromCanvas(m) })) },
-    { title: '✨', y: 438, items: weeklySpecialItems() }
-  ];
-  const slot = 112, gap = 16, startX = 90;
-  for (const row of rows) {
-    drawIcon(row.title, 44, row.y + slot / 2, 30);
-    row.items.slice(0, 5).forEach((item, i) => {
-      const x = startX + i * (slot + gap), y = row.y;
-      const affordable = Number(state.user.coins) >= item.price;
-      const disabled = item.disabled || (!affordable && item.price > 0);
-      drawCanvasSlot(x, y, slot, slot, { alpha: disabled ? .58 : 1, stroke: affordable || item.price === 0 ? 'rgba(255,255,255,.16)' : 'rgba(255,135,120,.32)' });
-      const bgIcon = item.rowIcon || item.shop_row_icon || item.icon || '';
-      if (bgIcon && isImageIcon(bgIcon)) {
-        ctx.save();
-        ctx.globalAlpha = disabled ? .18 : .28;
-        drawIcon(bgIcon, x + slot / 2, y + slot / 2, slot * .92);
-        ctx.restore();
-      }
-      ctx.globalAlpha = disabled ? .45 : 1;
-      drawIcon(item.icon || '❔', x + slot / 2, y + 44, 46);
+
+  drawPanelBackground(
+    shopIcon,
+    locationBackgroundForNow('shop', ['store', 'general_store'], { forceDay: hideSecretNight })
+  );
+
+  const slot = 90;
+  const gap = 8;
+  const perRow = 6;
+  const startX = 54;
+  const rowH = slot + 16;
+
+  const seeds = (state.plants || [])
+    .filter(p => Number(p.base_buy_price || 0) > 0)
+    .map(p => ({
+      code: p.seed_code || p.code,
+      plant: p,
+      icon: p.seed_icon,
+      rowIcon: p.seed_shop_row_icon || p.seed_icon,
+      name: p.seed_name || p.name,
+      price: Number(p.base_buy_price || 0),
+      action: () => buySeedFromCanvas(p)
+    }));
+
+  const machines = (state.all_machines || [])
+    .map(m => ({
+      code: m.code || m.machine_type,
+      machine: m,
+      icon: m.icon,
+      rowIcon: m.shop_row_icon || m.icon,
+      name: m.name,
+      price: Number(m.base_cost || 0),
+      action: () => buyMachineFromCanvas(m)
+    }));
+
+  const specials = weeklySpecialItems();
+
+  function drawRow(items, yStart, sectionIcon) {
+    if (!items.length) return 0;
+
+    const rowCount = Math.ceil(items.length / perRow);
+    drawIcon(sectionIcon, 24, yStart + slot / 2, 22);
+
+    items.forEach((item, i) => {
+      const col = i % perRow;
+      const row = Math.floor(i / perRow);
+      const x = startX + col * (slot + gap);
+      const y = yStart + row * rowH;
+
+      const price = Number(item.price || 0);
+      const affordable = Number(state.user?.coins || 0) >= price;
+      const disabled = !!item.disabled || (!affordable && price > 0);
+
+      // Keep the card readable even when unaffordable.
+      // The red price already communicates "not enough coins"; no need to dim the whole icon.
+      drawCanvasSlot(x, y, slot, slot, {
+        alpha: 1,
+        stroke: affordable || price === 0
+          ? 'rgba(255,255,255,.16)'
+          : 'rgba(255,135,120,.30)'
+      });
+
+      // Skip drawing if we have no icon — item definitions not loaded yet
+      if (!item.icon) return;
+
+      // Always draw at full alpha; red price text communicates unaffordability
+      ctx.save();
       ctx.globalAlpha = 1;
-      if (item.price > 0) {
-        ctx.font = '16px system-ui';
+      drawIcon(item.icon, x + slot / 2, y + slot / 2 - 8, slot * .78);
+      ctx.restore();
+
+      if (price > 0) {
+        ctx.font = '13px system-ui';
         ctx.textAlign = 'right';
         ctx.fillStyle = affordable ? '#9bea74' : '#ff8778';
-        const priceText = String(item.price);
-        const priceX = x + slot - 12;
-        ctx.fillText(priceText, priceX, y + slot - 18);
-        const tw = ctx.measureText(priceText).width;
-        drawIcon(coinIcon(), priceX - tw - 12, y + slot - 23, 17);
+
+        const priceText = String(price);
+        const priceX = x + slot - 8;
+
+        ctx.fillText(priceText, priceX, y + slot - 12);
+        drawIcon(coinIcon(), priceX - ctx.measureText(priceText).width - 10, y + slot - 17, 14);
       } else if (item.comingSoon) {
-        ctx.font = '12px system-ui';
+        ctx.font = '10px system-ui';
         ctx.fillStyle = '#b8a88f';
         ctx.textAlign = 'center';
-        ctx.fillText('Coming Soon', x + slot / 2, y + slot - 18);
+        ctx.fillText('Soon', x + slot / 2, y + slot - 12);
       }
+
       const tooltip = item.comingSoon
         ? `<b>Today's Special</b><br><span class="muted-line">Coming soon.</span>`
-        : `<b>${escapeHtml(item.name)}</b><br><span class="muted-line">Price ${moneyHtml(item.price)}</span>${affordable ? '' : '<br><span style="color:#ff8778">Not enough coins</span>'}`;
-      canvasSceneHits.push({ x, y, w: slot, h: slot, tooltip, action: (!disabled && item.action) ? item.action : null });
+        : `<b>${escapeHtml(item.name)}</b><br><span class="muted-line">Price ${moneyHtml(price)}</span>${affordable ? '' : '<br><span style="color:#ff8778">Not enough coins</span>'}`;
+
+      canvasSceneHits.push({
+        id: item.code ? `shop:${item.code}` : `shop:item:${i}`,
+        x,
+        y,
+        w: slot,
+        h: slot,
+        tooltip,
+        action: (!disabled && item.action) ? item.action : null
+      });
     });
+
+    return rowCount * rowH;
   }
+// Shop Icons
+  let y = 28;
+  y += drawRow(seeds, y, '🌱') + 14;
+  y += drawRow(machines, y, '🛠️') + 14;
+  y += drawRow(specials, y, '✨') + 8;
+
+// Shop hint
+  drawShopHint(y);
+}
+
+function drawShopHint(y) {
+  const hints = state?.shop_hints || [];
+  if (!hints.length) return;
+
+  const now = performance.now();
+  const cycleDuration = 60000; // 60 seconds per hint
+  const fadeMs = 900;
+
+  if (now - shopHintLastChanged > cycleDuration) {
+    shopHintIndex = (shopHintIndex + 1) % hints.length;
+    shopHintLastChanged = now;
+  }
+
+  const age = now - shopHintLastChanged;
+  const alpha =
+    age < fadeMs
+      ? age / fadeMs
+      : age > cycleDuration - fadeMs
+        ? Math.max(0, (cycleDuration - age) / fadeMs)
+        : 1;
+
+  const hint = hints[shopHintIndex];
+  if (!hint) return;
+
+  const bx = 35;
+  const bw = canvasLogicalWidth() - 48;
+  const bh = 52;
+  const by = Math.min(
+    canvasLogicalHeight() - bh - 10,
+    Math.max(y + 10, canvasLogicalHeight() - bh - 10)
+  );
+
+  ctx.save();
+
+  // CRITICAL: start a fresh path so the hint does not refill the last shop card.
+  ctx.beginPath();
+  ctx.globalAlpha = alpha * 0.88;
+  ctx.fillStyle = 'rgba(20, 14, 8, 0.82)';
+
+  if (ctx.roundRect) {
+    ctx.roundRect(bx, by, bw, bh, 10);
+  } else {
+    ctx.rect(bx, by, bw, bh);
+  }
+
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(200, 170, 100, 0.28)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.beginPath();
+
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = '#c5a46a';
+  ctx.font = '800 11px system-ui';
+  ctx.textAlign = 'left';
+
+  if (hint.hint_speaker) {
+    ctx.fillText(hint.hint_speaker, bx + 14, by + 16);
+  }
+
+  ctx.fillStyle = '#e8d9b8';
+  ctx.font = '12px system-ui';
+  wrapCanvasText(
+    String(hint.hint_text || ''),
+    bx + 14,
+    by + (hint.hint_speaker ? 32 : 28),
+    bw - 28,
+    16
+  );
+
+  ctx.restore();
 }
 
 function drawPanelBackgroundLayer(backgroundImage = '', alpha = 1) {
@@ -3089,11 +4189,701 @@ function drawGardenCanvas() {
   drawGhost();
 }
 
+function renderGardenTabs() {
+  const bar = document.getElementById('gardenTabsBar');
+  if (!bar) return;
+
+  // Only show garden navigation while on the garden screen
+  if (currentTabName() !== 'garden') { bar.hidden = true; return; }
+
+  const gardens = state?.gardens || [];
+  if (gardens.length <= 1) { bar.hidden = true; return; }
+
+  bar.hidden = false;
+  bar.innerHTML = '';
+  for (const g of gardens) {
+    const isActive = Number(g.garden_id) === Number(activeGardenId);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `garden-tab-btn${isActive ? ' active' : ''}`;
+    const icon = g.garden_type_icon || '🌱';
+    btn.textContent = `${icon} ${g.name || g.garden_type_name || 'Garden'}`;
+    btn.addEventListener('click', () => {
+      if (!isActive) {
+        activeGardenId = Number(g.garden_id);
+        _ornamentalGridKey = null;
+        _ornamentalBgUrl   = null; // force bg crossfade for new garden
+        const cached = gardenStateCache.get(activeGardenId);
+        if (cached) {
+          // Restore full cached payload — visually instant
+          Object.assign(state, cached);
+        } else {
+          // First visit: show skeleton (blank garden) while fetching
+          const target = (state.gardens || []).find(gg => Number(gg.garden_id) === activeGardenId);
+          if (target) {
+            state.garden = { ...target };
+            state.plots = [];
+            state.crops = [];
+            state.pot_placements = [];
+          }
+        }
+        render(); // immediate visual switch
+        fetchState({ force: true }); // refresh from server in background
+      }
+    });
+    bar.appendChild(btn);
+  }
+}
+
+// ---- Ornamental pot hit rects (reuse tileRects structure) ----
+let potSlotRects = [];
+
+// Lightweight canvas function for ornamental.
+// The DOM overlay owns the visual background; the canvas just draws a dark fill.
+// Fae-offering pouches are still drawn on the canvas (they appear in empty areas).
+function drawOrnamentalBackground() {
+  potSlotRects = [];
+  tileRects = [];
+  canvasSceneHits = [];
+  ctx.save();
+  ctx.fillStyle = '#211a13';
+  ctx.strokeStyle = 'rgba(255,255,255,.08)';
+  ctx.lineWidth = 2;
+  fillStrokeRound(8, 8, canvasLogicalWidth() - 16, canvasLogicalHeight() - 16, 24);
+  ctx.restore();
+  if (!state?.pouch || state.pouch.pouch_type === 'fae_offering') drawPouch();
+}
+
+// ── Fae offering fly-to-inventory animation ────────────────────────────────
+
+function flyOfferingToInventory(icon, fromX, fromY, qty) {
+  const dest = document.getElementById('inventoryBtn');
+
+  // Create the flying element
+  const el = document.createElement('div');
+  el.className = 'offering-fly';
+  el.style.left = fromX + 'px';
+  el.style.top  = fromY + 'px';
+  el.style.opacity = '1';
+  el.style.transform = 'translate(-50%, -50%) scale(1)';
+
+  if (icon && isImageIcon(icon)) {
+    el.innerHTML = `<img src="${escapeHtml(icon)}" alt="offering">`;
+  } else {
+    el.textContent = icon || '✨';
+  }
+
+  document.body.appendChild(el);
+
+  // Determine destination centre
+  let dx = 0;
+  let dy = -120; // fallback: float up
+
+  if (dest) {
+    const dr = dest.getBoundingClientRect();
+    dx = (dr.left + dr.width / 2) - fromX;
+    dy = (dr.top + dr.height / 2) - fromY;
+  }
+
+  // Kick off the animation on next frame so the initial position is painted first
+  requestAnimationFrame(() => {
+    el.style.transition = 'transform 0.9s cubic-bezier(0.4,0,0.2,1), opacity 1.2s ease';
+    el.style.transform  = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px)) scale(0.5)`;
+    el.style.opacity    = '0';
+
+    setTimeout(() => el.remove(), 1250);
+  });
+}
+
+// ── DOM-based ornamental overlay renderer ──────────────────────────────────
+
+let _ornamentalGridKey  = null; // last grid render snapshot
+let _ornamentalBgUrl    = null; // current background URL shown
+let _ornamentalBgLayers = [];   // [older-layer, newer-layer] DOM refs
+
+function _ornamentalRenderKey() {
+  const placements = state?.pot_placements || [];
+  return JSON.stringify(placements.map(p => ({
+    id: p.placement_id, gx: p.grid_x, gy: p.grid_y,
+    step: p.growth_step_current, glow: p.glow_eligible,
+    plant: p.planted_crop_id, pot: p.pot_type_id,
+    water: Math.round(Number(p.water_current || 0)),
+  }))) + '|mode:' + selectedMode.type;
+}
+
+function _ornamentalUpdateBg(overlay) {
+  const bg  = gardenBackgroundForNow();
+  const url = bg && isImageIcon(bg) ? cssImageUrl(bg) : '';
+  if (url === _ornamentalBgUrl) return; // no change
+  _ornamentalBgUrl = url;
+
+  const isFirst = _ornamentalBgLayers.length === 0;
+
+  const newLayer = document.createElement('div');
+  newLayer.className = 'ornamental-bg-layer';
+  newLayer.style.backgroundImage = url;
+  // First appearance: show instantly (no transition) so garden isn't dark on load.
+  // Subsequent changes (day↔night): cross-fade.
+  newLayer.style.opacity = isFirst ? '1' : '0';
+  // Insert before the grid so it stays behind all slot content
+  const grid = overlay.querySelector('.ornamental-grid');
+  overlay.insertBefore(newLayer, grid || null);
+
+  if (!isFirst) {
+    requestAnimationFrame(() => { newLayer.style.opacity = '1'; });
+    const oldLayers = _ornamentalBgLayers.slice();
+    oldLayers.forEach(l => {
+      l.style.opacity = '0';
+      setTimeout(() => { if (l.parentNode) l.remove(); }, 2100);
+    });
+  }
+  _ornamentalBgLayers = [newLayer];
+}
+
+function renderOrnamentalOverlay() {
+  const overlay = document.getElementById('ornamentalOverlay');
+  if (!overlay) return;
+
+  const isOrnamental = state?.garden?.garden_type_code === 'ornamental';
+  const inGarden     = currentTabName() === 'garden';
+
+  if (!isOrnamental || !inGarden) {
+    overlay.hidden = true;
+    overlay.classList.remove('ornamental-day', 'ornamental-night');
+    return;
+  }
+
+  overlay.hidden = false;
+  overlay.classList.toggle('ornamental-day', isDayPhaseNow());
+  overlay.classList.toggle('ornamental-night', !isDayPhaseNow());
+
+  // Always update the background (fades smoothly)
+  _ornamentalUpdateBg(overlay);
+
+  // Only rebuild the grid DOM when data actually changes — prevents animation blink
+  const key = _ornamentalRenderKey();
+  if (key === _ornamentalGridKey) return;
+  _ornamentalGridKey = key;
+
+  const placements = state.pot_placements || [];
+
+  const grid = document.createElement('div');
+  grid.className = 'ornamental-grid';
+
+  for (let gy = 1; gy <= 3; gy++) {
+    for (let gx = 1; gx <= 3; gx++) {
+      const placement = placements.find(p => Number(p.grid_x) === gx && Number(p.grid_y) === gy);
+      const slot = document.createElement('div');
+      slot.className = 'ornamental-slot';
+
+      if (placement) {
+        ornamentalRenderPot(slot, placement);
+      } else {
+        slot.classList.add('empty-slot');
+
+        if (selectedMode.type === 'pot') {
+          slot.classList.add('can-place');
+
+          const plus = document.createElement('span');
+          plus.className = 'slot-plus';
+          plus.textContent = '+';
+          slot.appendChild(plus);
+        }
+      }
+
+      const slotData = { gridX: gx, gridY: gy, placement: placement || null };
+
+      slot.addEventListener('click', () => {
+        // Pass screen-space centre of the slot so fly animations have a valid origin
+        const r = slot.getBoundingClientRect();
+
+        performOrnamentalAction(slotData, {
+          x: r.left + r.width / 2,
+          y: r.top + r.height / 2,
+          screenSpace: true
+        });
+      });
+
+      grid.appendChild(slot);
+    }
+  }
+
+  // Remove old grid (bg layers stay), add new grid
+  overlay.querySelectorAll('.ornamental-grid').forEach(el => el.remove());
+  overlay.appendChild(grid);
+}
+
+function ornamentalRenderPot(slot, placement) {
+  const step    = Number(placement.growth_step_current || 0);
+  const maxStep = Math.max(1, Number(placement.growth_steps || 1));
+  const growFrac = step / maxStep;
+  const isGlowing = Number(placement.glow_eligible) === 1 && !!placement.planted_crop_id;
+  // Glow is on the plant only — do NOT add a class to the whole slot
+
+  // 1. Pot back
+  const back = document.createElement('div');
+  back.className = 'pot-back';
+  if (placement.back_image && isImageIcon(placement.back_image)) {
+    back.style.backgroundImage = cssImageUrl(placement.back_image);
+  } else {
+    back.style.background = 'radial-gradient(ellipse at 50% 80%, #7a4f26 60%, #5c3a1c 100%)';
+    back.style.borderRadius = '0 0 40% 40%';
+  }
+  slot.appendChild(back);
+
+  // 2. Plant (sits between back and front via z-index)
+  if (placement.planted_crop_id) {
+    const plant = document.createElement('div');
+    plant.className = 'pot-plant' + (isGlowing ? ' plant-glowing' : '');
+    const plantCode = String(placement.plant_code || '').replace(/_bush$/, '');
+    if (plantCode && step > 0) {
+      const src = `assets/icons/crops/${plantCode}_${step}.png`;
+      // max-width drives growth-stage size; CSS max-height 100% keeps it inside the slot
+      const sizePct = Math.round(30 + growFrac * 70); // 30% (seedling) → 100% (mature)
+      plant.innerHTML = `<img src="${escapeHtml(src)}" alt="${escapeHtml(placement.plant_name || 'Plant')}" style="max-width:${sizePct}%;max-height:100%">`;
+    }
+    slot.appendChild(plant);
+  }
+
+  // 3. Pot front (overlays plant via z-index)
+  const front = document.createElement('div');
+  front.className = 'pot-front';
+  if (placement.front_image && isImageIcon(placement.front_image)) {
+    front.style.backgroundImage = cssImageUrl(placement.front_image);
+  } else {
+    // Placeholder rim: just top band
+    front.style.background = 'linear-gradient(to bottom, #a0622f 0%, #a0622f 22%, transparent 22%)';
+    front.style.borderRadius = '8px 8px 0 0';
+  }
+  slot.appendChild(front);
+
+  // 4. Water bar (only while growing)
+  if (placement.planted_crop_id && step < maxStep) {
+    const waterPct = Number(placement.water_current || 0) / Math.max(1, Number(placement.water_max || 100));
+    const bar  = document.createElement('div');
+    bar.className = 'pot-water-bar';
+    const fill = document.createElement('div');
+    fill.className = 'pot-water-fill';
+    fill.style.width = `${Math.round(Math.max(2, waterPct * 100))}%`;
+    fill.style.backgroundColor = waterPct < 0.25 ? '#ff6a30' : waterPct < 0.55 ? '#f0c840' : '#50bce0';
+    bar.appendChild(fill);
+    slot.appendChild(bar);
+  }
+
+  // 5. Glow collect hint
+  if (isGlowing) {
+    const hint = document.createElement('div');
+    hint.className = 'pot-glow-hint';
+    hint.textContent = '✨ Collect';
+    slot.appendChild(hint);
+  }
+}
+
+function drawEmptyPotSlot(x, y, w, h, gx, gy) {
+  ctx.save();
+  ctx.globalAlpha = selectedMode.type === 'pot' ? 0.55 : 0.22;
+  ctx.strokeStyle = 'rgba(200, 170, 100, 0.6)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 5]);
+  if (ctx.roundRect) ctx.roundRect(x + 8, y + 8, w - 16, h - 16, 14);
+  else ctx.rect(x + 8, y + 8, w - 16, h - 16);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  if (selectedMode.type === 'pot') {
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = '#c5a46a';
+    ctx.font = '800 28px system-ui';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('+', x + w / 2, y + h / 2);
+  }
+  ctx.restore();
+}
+
+function drawPotPlacement(placement, x, y, w, h) {
+  const isGlowing = Number(placement.glow_eligible) === 1 && !!placement.planted_crop_id;
+  const pulse = 0.5 + Math.sin(performance.now() / 420) * 0.3;
+
+  // Pot is smaller than the slot so the plant is the visual focus.
+  // Pot sits in the lower half; plant rises through the open top.
+  const potW = w * 0.68;
+  const potH = h * 0.50;
+  const potX = x + (w - potW) / 2;
+  const potY = y + h * 0.46;
+
+  ctx.save();
+
+  // ── 1. POT BACK ────────────────────────────────────────────────
+  ctx.shadowBlur = 0;
+  const backImg = placement.back_image;
+  if (backImg && isImageIcon(backImg)) {
+    preloadImageAsset(backImg);
+    const bImg = imageCache[backImg];
+    if (bImg?.complete && bImg.naturalWidth && !bImg.failed) {
+      ctx.drawImage(bImg, potX, potY, potW, potH);
+    } else { drawPotBodyPlaceholder(potX, potY, potW, potH); }
+  } else { drawPotBodyPlaceholder(potX, potY, potW, potH); }
+
+  // ── 2. PLANT ───────────────────────────────────────────────────
+  if (placement.planted_crop_id) {
+    const step    = Number(placement.growth_step_current || 0);
+    const maxStep = Math.max(1, Number(placement.growth_steps || 1));
+    const plantCode = String(placement.plant_code || '').replace(/_bush$/, '');
+    const growFrac = step / maxStep;
+    if (step > 0 && plantCode) {
+      const icon = `assets/icons/crops/${plantCode}_${step}.png`;
+      // Grows from small seed to large plant that rises above the pot rim
+      const plantSize = w * (0.34 + growFrac * 0.60);
+      const plantCX   = x + w / 2;
+      const plantCY   = potY + potH * 0.20 - growFrac * potH * 0.65;
+      if (isGlowing) { ctx.shadowColor = 'rgba(255,215,60,0.7)'; ctx.shadowBlur = 14 + pulse * 9; }
+      drawIcon(icon, plantCX, plantCY, plantSize);
+      ctx.shadowBlur = 0; ctx.shadowColor = 'transparent';
+    }
+  }
+
+  // ── 3. POT FRONT (same size/position as back) ──────────────────
+  const frontImg = placement.front_image;
+  if (frontImg && isImageIcon(frontImg)) {
+    preloadImageAsset(frontImg);
+    const fImg = imageCache[frontImg];
+    if (fImg?.complete && fImg.naturalWidth && !fImg.failed) {
+      ctx.drawImage(fImg, potX, potY, potW, potH);
+    } else { drawPotRimPlaceholder(potX, potY, potW, potH); }
+  } else { drawPotRimPlaceholder(potX, potY, potW, potH); }
+
+  // ── 4. WATER BAR ───────────────────────────────────────────────
+  if (placement.planted_crop_id) {
+    const step    = Number(placement.growth_step_current || 0);
+    const maxStep = Math.max(1, Number(placement.growth_steps || 1));
+    const grown   = step >= maxStep;
+    if (!grown) {
+      const waterPct = Number(placement.water_current || 0) / Math.max(1, Number(placement.water_max || 100));
+      const barW = potW * 0.76, barH = 5;
+      const barX = potX + (potW - barW) / 2, barY = y + h - 13;
+      ctx.fillStyle = 'rgba(0,0,0,0.3)';
+      if (ctx.roundRect) ctx.roundRect(barX, barY, barW, barH, 2); else ctx.rect(barX, barY, barW, barH);
+      ctx.fill();
+      ctx.fillStyle = waterPct < 0.25 ? '#ff6a30' : waterPct < 0.55 ? '#f0c840' : '#50bce0';
+      if (ctx.roundRect) ctx.roundRect(barX, barY, Math.max(2, barW * waterPct), barH, 2); else ctx.rect(barX, barY, Math.max(2, barW * waterPct), barH);
+      ctx.fill();
+    }
+  }
+
+  // ── 5. GLOW OVERLAY ────────────────────────────────────────────
+  if (isGlowing) {
+    ctx.globalAlpha = 0.10 + pulse * 0.07;
+    ctx.fillStyle = 'rgba(255,215,60,1)';
+    if (ctx.roundRect) ctx.roundRect(x+4, y+4, w-8, h-8, 12); else ctx.rect(x+4, y+4, w-8, h-8);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.font = '800 10px system-ui'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,240,160,0.92)';
+    ctx.fillText('✨ Collect', x + w / 2, y + h - 3);
+  }
+
+  ctx.restore();
+
+  // Tooltip
+  const tName = placement.plant_name || (placement.pot_type_name || 'Pot');
+  const tStep = Number(placement.growth_step_current || 0);
+  const tMax  = Math.max(1, Number(placement.growth_steps || 1));
+  const tipText = placement.planted_crop_id
+    ? (tStep >= tMax
+        ? '<b>' + escapeHtml(tName) + '</b><br><span class="muted-line">Fully grown — click to collect fae offering.</span>'
+        : '<b>' + escapeHtml(tName) + '</b><br><span class="muted-line">Growing (' + tStep + '/' + tMax + ')</span>')
+    : '<b>' + escapeHtml(placement.pot_type_name || 'Pot') + '</b><br><span class="muted-line">Select an ornamental seed to plant here.</span>';
+  canvasSceneHits.push({ x, y, w, h, tooltip: tipText });
+}
+
+function drawPotBodyPlaceholder(x, y, w, h) {
+  // Terracotta pot body
+  ctx.fillStyle = '#8b5a2b';
+  if (ctx.roundRect) ctx.roundRect(x + w * 0.12, y + h * 0.34, w * 0.76, h * 0.6, 10);
+  else ctx.rect(x + w * 0.12, y + h * 0.34, w * 0.76, h * 0.6);
+  ctx.fill();
+  // Base
+  ctx.fillStyle = '#7a4f26';
+  if (ctx.roundRect) ctx.roundRect(x + w * 0.08, y + h * 0.88, w * 0.84, h * 0.1, 5);
+  else ctx.rect(x + w * 0.08, y + h * 0.88, w * 0.84, h * 0.1);
+  ctx.fill();
+}
+
+function drawPotRimPlaceholder(x, y, w, h) {
+  // Pot rim ellipse
+  ctx.fillStyle = '#a0622f';
+  ctx.strokeStyle = '#6b3d1a';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.ellipse(x + w / 2, y + h * 0.35, w * 0.4, h * 0.07, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+}
+
+function getPotSlotFromEvent(evt) {
+  if (!potSlotRects.length) return null;
+  setPointerFromEvent(evt);
+  return potSlotRects.find(r =>
+    pointerCanvasPos.x >= r.x && pointerCanvasPos.x <= r.x + r.w &&
+    pointerCanvasPos.y >= r.y && pointerCanvasPos.y <= r.y + r.h
+  ) || null;
+}
+
+function performOrnamentalAction(slot, pointerPos) {
+  if (!slot) return;
+
+  const fxPoint = {
+    x: pointerPos?.x ?? slot.x + slot.w / 2,
+    y: pointerPos?.y ?? slot.y
+  };
+
+  const placement = slot.placement;
+
+  if (!placement) {
+    // Empty slot
+    if (selectedMode.type === 'pot') {
+      const potTypeId = Number(selectedMode.value);
+      const potType = (state.ornamental_pot_types || []).find(pt => Number(pt.pot_type_id) === potTypeId);
+
+      if (!potType) return showStatus('No pot selected.', true);
+
+      // Optimistic: remove pot from inventory
+      const inv = (state.inventory || []).find(i => Number(i.item_id) === Number(potType.item_id));
+
+      if (inv) {
+        inv.quantity = Math.max(0, Number(inv.quantity) - 1);
+      }
+
+      state.pot_placements = state.pot_placements || [];
+
+      state.pot_placements.push({
+        placement_id: -Date.now(),
+        grid_x: slot.gridX,
+        grid_y: slot.gridY,
+        pot_type_id: potTypeId,
+        pot_type_name: potType.name,
+        pot_size: potType.pot_size,
+        back_image: potType.back_image,
+        front_image: potType.front_image,
+        plant_offset_y: potType.plant_offset_y,
+        planted_crop_id: null,
+        glow_eligible: 0
+      });
+
+      render();
+
+      doAction(
+        {
+          action: 'place_pot',
+          garden_id: Number(state.garden.garden_id),
+          pot_type_id: potTypeId,
+          grid_x: slot.gridX,
+          grid_y: slot.gridY
+        },
+        null,
+        { silent: true }
+      ).then(() => scheduleSoftGardenRefresh(1200));
+
+      return;
+    }
+
+    return showStatus('Select a pot from your backpack to place here.', false);
+  }
+
+  // Occupied slot: glowing → collect immediately, SQL catches up in background.
+  if (Number(placement.glow_eligible) === 1) {
+    const placementId = Number(placement.placement_id);
+    const offeringIcon = placement.plant_mature_icon || '✨';
+
+    const flyX = pointerPos?.screenSpace
+      ? pointerPos.x
+      : canvasPointToScreenPoint(pointerPos || { x: fxPoint.x, y: fxPoint.y }).x;
+
+    const flyY = pointerPos?.screenSpace
+      ? pointerPos.y
+      : canvasPointToScreenPoint(pointerPos || { x: fxPoint.x, y: fxPoint.y }).y;
+
+    // Client-first: remove glow and animate immediately.
+    placement.glow_eligible = 0;
+    _ornamentalGridKey = null;
+    render();
+
+    flyOfferingToInventory(offeringIcon, flyX, flyY, null);
+
+    doAction(
+      {
+        action: 'collect_pot_offering',
+        placement_id: placementId
+      },
+      null,
+      {
+        silent: true,
+        trustClient: false
+      }
+    ).then(data => {
+      if (data?.ok) {
+        if (data.message) showStatus(data.message);
+        scheduleSoftGardenRefresh(1500);
+        return;
+      }
+
+      fetchState({ force: true });
+    }).catch(() => {
+      showStatus('Could not collect that offering.', true);
+      fetchState({ force: true });
+    });
+
+    return;
+  }
+
+  // Watering
+  if (selectedMode.type === 'tool' && selectedMode.value === 'watering_can') {
+    if (!placement.planted_crop_id) return showStatus('Nothing to water.', true);
+
+    const cropId = Number(placement.planted_crop_id);
+    const strength = Number(getTool('watering_can')?.strength || 15);
+    const newWater = Math.min(
+      Number(placement.water_max || 100),
+      Number(placement.water_current || 0) + strength
+    );
+
+    placement.water_current = newWater;
+
+    canvasFloatFx.push({
+      icon: '💧',
+      text: '',
+      x: fxPoint.x,
+      y: fxPoint.y,
+      createdAt: performance.now()
+    });
+
+    render();
+
+  doAction(
+  {
+    action: 'water',
+    planted_crop_id: cropId,
+    water_current: newWater
+  },
+  null,
+  {
+    silent: true
+  }
+);
+ 
+    return;
+  }
+
+  // Dig up plant / remove empty pot
+  if (selectedMode.type === 'tool' && selectedMode.value === 'shovel') {
+    if (!placement.planted_crop_id) {
+      // No plant — allow removing the empty pot
+      if (confirm('Remove this pot and return it to your backpack?')) {
+        state.pot_placements = (state.pot_placements || []).filter(
+          p => Number(p.placement_id) !== Number(placement.placement_id)
+        );
+
+        _ornamentalGridKey = null;
+        render();
+
+        doAction(
+          {
+            action: 'remove_pot',
+            placement_id: Number(placement.placement_id)
+          },
+          null,
+          { silent: true }
+        ).then(() => scheduleSoftGardenRefresh(800));
+      }
+
+      return;
+    }
+
+    if (!confirm('Dig up this plant? The seed will be lost.')) return;
+
+    const oldCropId = placement.planted_crop_id;
+
+    placement.planted_crop_id = null;
+    placement.growth_step_current = 0;
+    placement.water_current = 0;
+    placement.glow_eligible = 0;
+
+    _ornamentalGridKey = null;
+    render();
+
+    doAction(
+      {
+        action: 'dig_pot_plant',
+        placement_id: Number(placement.placement_id),
+        planted_crop_id: Number(oldCropId)
+      },
+      null,
+      { silent: true }
+    ).then(() => scheduleSoftGardenRefresh(800));
+
+    return;
+  }
+
+  // Planting
+  if (selectedMode.type === 'seed') {
+    if (placement.planted_crop_id) return showStatus('Already has a plant. Wait for it to grow.', true);
+
+    const plant = (state.plants || []).find(p => Number(p.plant_id) === Number(selectedMode.value));
+    if (!plant) return;
+
+    // Optimistic: reduce seed count
+    const inv = (state.inventory || []).find(i => Number(i.item_id) === Number(plant.seed_item_id));
+
+    if (inv) {
+      inv.quantity = Math.max(0, Number(inv.quantity) - 1);
+    }
+
+    render();
+
+    // Bypass the gardenSaveQueue and pass null for fx so the ✨ fx_plant icon does not fire.
+    doAction(
+      {
+        action: 'plant',
+        garden_id: Number(state.garden.garden_id),
+        plant_id: Number(plant.plant_id),
+        x: slot.gridX,
+        y: slot.gridY
+      },
+      null,
+      { trustClient: false }
+    ).then(data => {
+      if (data?.ok) fetchState({ force: true });
+    });
+
+    return;
+  }
+
+  showStatus(
+    placement.planted_crop_id
+      ? 'Water with the watering can, collect when glowing, or dig up with the shovel.'
+      : 'Select a seed to plant, or use the shovel to remove the pot.',
+    false
+  );
+}
+
+function hideInitialCanvasLoader() {
+  const loader = document.getElementById('initialCanvasLoader');
+  if (!loader || loader.dataset.hidden === '1') return;
+
+  loader.dataset.hidden = '1';
+  loader.classList.add('is-hidden');
+
+  setTimeout(() => {
+    if (loader.parentNode) loader.remove();
+  }, 320);
+}
+
 function draw() {
   requestAnimationFrame(draw);
   if (!canvas || !ctx) return;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.globalAlpha = 1; // reset every frame — clearRect does not reset drawing state
   ctx.setTransform(canvasDpr, 0, 0, canvasDpr, 0, 0);
 
   if (!state) {
@@ -3102,7 +4892,7 @@ function draw() {
     ctx.fillStyle = '#b8a88f';
     ctx.font = '24px system-ui';
     ctx.textAlign = 'center';
-    ctx.fillText('Loading field...', canvasLogicalWidth() / 2, canvasLogicalHeight() / 2);
+    ctx.fillText('Loading Mossroot Hollow ...', canvasLogicalWidth() / 2, canvasLogicalHeight() / 2);
     return;
   }
 
@@ -3118,6 +4908,7 @@ function draw() {
   else if (tab === 'caravan') drawSimpleScene('Caravan Camp', locationIconFor('caravan', '🔮', ['caravan_camp']), locationBackgroundForNow('caravan', ['caravan_camp']), 'caravan');
   else if (tab === 'bone_brine') drawSimpleScene('Bone & Brine', locationIconFor('bone_brine', '☠️'), locationBackgroundForNow('bone_brine'), 'bone_brine');
   else if (tab === 'admin') drawSimpleScene('Admin Debug', locationIconFor('admin', '🛠️'), locationBackgroundForNow('admin'), 'admin');
+  else if (state?.garden?.garden_type_code === 'ornamental') drawOrnamentalBackground();
   else drawGardenCanvas();
 
   if (helperAccessoryDrag && pointerCanvasPos && currentTabName() === 'helpers') {
@@ -3153,16 +4944,82 @@ function buyMachineFromCanvas(machine) {
 }
 
 function buySpecialItemFromCanvas(code, item) {
-  if (Number(state.user.coins) < Number(item.base_buy_price || 175)) return showStatus('Not enough coins.', true);
-  const x = pointerCanvasPos?.x || canvasLogicalWidth() / 2, y = pointerCanvasPos?.y || canvasLogicalHeight() / 2;
-  const price = Number(item.base_buy_price || 175);
-  state.user.coins -= price;
-  const existing = state.inventory.find(i => i.code === code);
-  if (existing) existing.quantity = Number(existing.quantity || 0) + 1;
-  else state.inventory.push({ code, name: item.name || 'Land Claim Note', item_type: 'material', icon: item.icon || '📜', quantity: 1, base_sell_price: 0, base_buy_price: price });
-  canvasFloatFx.push({ icon: item.icon || '📜', text: '+1', x, y, createdAt: performance.now() });
+  const itemDef = itemDefinitionByCode(code);
+
+  const mergedItem = {
+    code,
+    name: code,
+    item_type: 'material',
+    base_sell_price: 0,
+    base_buy_price: 175,
+    ...(itemDef || {}),
+    ...(item   || {}),
+
+    // Icon always from the DB definition; never a fallback emoji.
+    icon:          itemDef?.icon          || item?.icon          || null,
+    shop_row_icon: itemDef?.shop_row_icon || item?.shop_row_icon || itemDef?.icon || item?.icon || null,
+  };
+
+  const price = Number(mergedItem.base_buy_price || 175);
+
+  if (Number(state.user?.coins || 0) < price) {
+    return showStatus('Not enough coins.', true);
+  }
+
+  const x = pointerCanvasPos?.x || canvasLogicalWidth() / 2;
+  const y = pointerCanvasPos?.y || canvasLogicalHeight() / 2;
+
+  state.user.coins = Number(state.user.coins || 0) - price;
+
+  const existing = (state.inventory || []).find(i => i.code === code);
+
+  if (existing) {
+    existing.quantity = Number(existing.quantity || 0) + 1;
+
+    existing.icon            = itemDef?.icon      || existing.icon      || mergedItem.icon;
+    existing.name            = itemDef?.name      || existing.name      || mergedItem.name;
+    existing.item_type       = itemDef?.item_type || existing.item_type || mergedItem.item_type;
+    existing.base_sell_price = Number(itemDef?.base_sell_price || existing.base_sell_price || 0);
+    existing.base_buy_price  = price;
+  } else {
+    state.inventory = state.inventory || [];
+    state.inventory.push({
+      item_id:         mergedItem.item_id,
+      code,
+      name:            mergedItem.name      || 'Special Item',
+      item_type:       mergedItem.item_type || 'material',
+      icon:            mergedItem.icon,
+      quantity:        1,
+      base_sell_price: Number(mergedItem.base_sell_price || 0),
+      base_buy_price:  price
+    });
+  }
+
+  // Local optimistic update so weeklySpecialItems() immediately rebuilds
+  // the deed count and next price before the server refresh returns.
+  if (code === 'land_claim_note') {
+    state.land_claim_shop_purchases = Number(state.land_claim_shop_purchases || 0) + 1;
+  }
+
+  canvasFloatFx.push({
+    icon: mergedItem.icon,
+    text: '+1',
+    x,
+    y,
+    createdAt: performance.now()
+  });
+}
+
+function rebuildShopItemsAfterPurchase() {
+  if (typeof weeklySpecialItems === 'function') {
+    state.weekly_special_items = weeklySpecialItems();
+  }
+
+  if (typeof buildShopItems === 'function') {
+    state.shop_items = buildShopItems();
+  }
+
   render();
-  doAction({ action: 'buy_special_item', code }, null, { silent: true });
 }
 
 function buyToolFromCanvas(tool) {
@@ -3326,17 +5183,32 @@ function closeOrdersModal() {
   hideTooltip();
 }
 
-function openStoryModal({ title, body, button = 'Okay', closeable = false, onNext = null }) {
+function openStoryModal({ title, body, button = 'Okay', closeable = false, portrait = null, speakerName = null, onNext = null }) {
   const modal = $('#storyModal');
   const titleEl = $('#storyTitle');
   const bodyEl = $('#storyContent');
   const btn = $('#storyNextBtn');
   const close = $('#storyCloseBtn');
   if (!modal || !titleEl || !bodyEl || !btn) return;
+
   titleEl.textContent = title;
   bodyEl.innerHTML = body;
+  bodyEl.scrollTop = 0;
   btn.textContent = button;
   if (close) close.hidden = !closeable;
+
+  const portraitCol = $('#storyPortrait');
+  const portraitImg = $('#storyPortraitImg');
+  const portraitName = $('#storyPortraitName');
+  if (portraitCol && portraitImg && portrait) {
+    portraitImg.src = portrait;
+    portraitImg.alt = speakerName || '';
+    if (portraitName) portraitName.textContent = speakerName || '';
+    portraitCol.hidden = false;
+  } else if (portraitCol) {
+    portraitCol.hidden = true;
+  }
+
   btn.onclick = async () => {
     if (onNext) await onNext();
   };
@@ -3346,8 +5218,11 @@ function openStoryModal({ title, body, button = 'Okay', closeable = false, onNex
 }
 
 function closeStoryModal() {
+  stopMachineModalTimer();
+
   const modal = $('#storyModal');
   if (modal) modal.classList.remove('is-open');
+
   document.body.classList.remove('modal-open');
   updateCanvasCursor();
   hideTooltip();
@@ -3355,16 +5230,34 @@ function closeStoryModal() {
 
 function openRelicFoundModal(relic) {
   if (!relic) return;
-  openStoryModal({
-    title: 'Something Strange Unearthed',
-    body: `<p>While tilling the soil, your hoe strikes something that is neither root nor stone.</p>
+
+  const isSecondRelic = String(relic.relic_key || '') === 'second_field_relic';
+
+  const title = isSecondRelic
+    ? 'Something Cursed Unearthed'
+    : 'Something Strange Unearthed';
+
+  const body = isSecondRelic
+    ? `<p>While tilling the soil, your hoe catches on something that should not have been waiting there.</p>
+      <p>You kneel down and brush the dirt away. The object is cold, old, and faintly unpleasant — not dangerous exactly, but definitely rude.</p>
+      <p>Whatever this cursed little relic is, it feels less like treasure and more like an invitation from someone with questionable hygiene and excellent branding.</p>`
+    : `<p>While tilling the soil, your hoe strikes something that is neither root nor stone.</p>
       <p>You kneel down and carefully dig the object free, brushing away the dirt with your fingertips. Whatever it is, it’s old — far older than anything that should be buried in an ordinary garden.</p>
-      <p>The strange relic is unlike anything you’ve ever seen, and yet it hums with a quiet sort of importance. You’re not sure what it is, but you are absolutely certain of one thing: it would look marvelous on your mantle.</p>`,
+      <p>The strange relic is unlike anything you’ve ever seen, and yet it hums with a quiet sort of importance. You’re not sure what it is, but you are absolutely certain of one thing: it would look marvelous on your mantle.</p>`;
+
+  openStoryModal({
+    title,
+    body,
     button: 'Take the Relic',
     closeable: true,
     onNext: async () => {
       const pos = relicPosition() || { x: canvasLogicalWidth() / 2, y: canvasLogicalHeight() / 2 };
-      const data = await doAction({ action: 'collect_relic', relic_id: Number(relic.relic_id) }, { kind: 'relic', x: pos.x, y: pos.y }, { silent: true });
+      const data = await doAction(
+        { action: 'collect_relic', relic_id: Number(relic.relic_id) },
+        { kind: 'relic', x: pos.x, y: pos.y },
+        { silent: true }
+      );
+
       if (data?.ok) {
         state.relic_pickup = null;
         addRewardsLocally(data.rewards || [], pos.x, pos.y);
@@ -3374,58 +5267,6 @@ function openRelicFoundModal(relic) {
     }
   });
 }
-
-const MADAM_RUNE_PAGES = [
-  {
-    title: 'A Caravan Arrives',
-    button: '... okay?',
-    body: `<p>Around midday, the quiet of your garden is interrupted by the creak of old wheels and the soft clatter of hanging charms.</p>
-      <p>A peculiar wagon rolls to a stop nearby, draped in moss, trailing vines, and enough dangling trinkets to worry any sensible horse.</p>
-      <p>From within emerges a goblin woman wrapped in layered fabrics, jangling jewelry, and a confidence usually reserved for people who know what they are doing.</p>
-      <p>“The hands of Fate have brought a visitor! ... or was it the <em>hams</em> of Fate?”</p>
-      <p>She squints at you, then gasps.</p>
-      <p>“Someone comes bearing <strong>DESTINY!</strong> ... and perhaps coupons!”</p>
-      <p>She pats her pockets, frowns, then looks suddenly delighted.</p>
-      <p>“Ah! Yes. Introductions. My name is... Sister Sa— no, no, that was Tuesday. Lady Cri— wait. What day even <em>is</em> it?”</p>
-      <p>She throws both hands into the air.</p>
-      <p>“Oh! Of course. <strong>I am Madam Rune!</strong>”</p>`
-  },
-  {
-    title: 'Madam Rune Peers at the Relic',
-    button: '... um ... okay?',
-    body: `<p>Madam Rune leans in toward the relic, her eyes widening until you begin to worry they might simply leave her head.</p>
-      <p>“Ohhh. Oh, that is <em>old</em>. Old Empire, unless I am mistaken. And I am only mistaken on Wednesdays, in matters of soup, and once about a goose.”</p>
-      <p>She taps the relic with one long fingernail.</p>
-      <p>“A vessel, you see. It once held <strong>aetherglimmer</strong> — or perhaps <strong>thrumlight</strong>. No, wait. Aetherglimmer. Definitely aetherglimmer. Probably.”</p>
-      <p>She presses it to her ear and smiles.</p>
-      <p>“Empty now, of course. But it still hums. Beautifully useless. My favorite kind of important.”</p>
-      <p>She rummages through her robes and produces three similar relics, each wrapped in bits of cloth and string.</p>
-      <p>“I have three others. Each one hums at a different pitch. But with yours? Ah! A quartet! A divine little quartet of forgotten imperial nonsense!”</p>
-      <p>Then she holds up an old bell.</p>
-      <p>“I tried using this thing, but it is far too high-pitched, and the fae would not leave it alone. Tiny winged busybodies. Always listening. Always curious. Always asking if mushrooms count as chairs.”</p>
-      <p>She places the bell in your hand, then adds a damp-looking crystal beside it.</p>
-      <p>“And this! An Aqua Amulet. It has the power to make <strong>anything wet</strong>. Simply place it upon the item you wish to moisten, pour water over it, and behold! Moisture!”</p>
-      <p>She nods gravely, as if she has just explained fire.</p>`
-  },
-  {
-    title: 'The Relic Finds Its Place',
-    button: 'Okay.',
-    body: `<p>Madam Rune carefully takes the relic and carries it to her wagon, where three similarly shaped objects rest on a velvet cloth.</p>
-      <p>She sets yours beside them.</p>
-      <p>Then moves it slightly.</p>
-      <p>Then slightly back.</p>
-      <p>Then forward by what cannot possibly be more than a hair’s width.</p>
-      <p>Several minutes pass.</p>
-      <p>At last, she clasps her hands together and beams.</p>
-      <p>“THERE! Beautiful! That sound is... the most clarity-inducing noise I have encountered in all my centuries!”</p>
-      <p>You listen closely.</p>
-      <p>You hear absolutely nothing.</p>
-      <p>Madam Rune, wearing a smile that seems to go on for days, sweeps back into her caravan. The door slams shut, the wheels creak, and the whole thing begins to roll away.</p>
-      <p>As she disappears down the road, she hollers back:</p>
-      <p>“If you find any more, save them for me! I’ll have a whole choir soon, just like the prophecy foretold!”</p>
-      <p>More confused than ever, you stow the bell and the moist rock, then turn back toward your garden.</p>`
-  }
-];
 
 function applyEventEffectsLocally(effects, x = canvasLogicalWidth() / 2, y = canvasLogicalHeight() / 2) {
   if (!effects) return;
@@ -3443,6 +5284,8 @@ function openDatabaseStoryEvent(event) {
     title: event.title || event.event_title || 'Event',
     body: event.body_html || '<p>Something happens.</p>',
     button: event.button_text || 'Okay',
+    portrait: event.portrait_image || null,
+    speakerName: event.speaker_name || null,
     closeable: false,
     onNext: async () => {
       const data = await doAction({ action: 'advance_story_event', event_key: event.event_key || event.key }, null, { silent: true });
@@ -3526,17 +5369,21 @@ function openCalendarModal() {
   const content = modal.querySelector('#calendarContent');
   const unlocked = hasUnlockKey('location_market');
   content.innerHTML = `
-    <p class="hint">Year ${snap.year}, Day ${snap.day} · ${calendarLabelForIndex(snap.weekIndex)} · ${String(snap.hour).padStart(2, '0')}:${String(snap.minute).padStart(2, '0')}</p>
-    <div class="calendar-grid ${unlocked ? 'has-fae-days' : ''}">
-      ${HUMAN_WEEK_DAYS.map((day, index) => `
-        <div class="calendar-day ${index === snap.weekIndex ? 'is-today' : ''}">
-          <b>${escapeHtml(day)}</b>
-          ${unlocked ? `<span>${escapeHtml(FAE_WEEK_DAYS[index])}</span>` : ''}
-        </div>
-      `).join('')}
-    </div>
-    ${unlocked ? '<p class="hint">The Fae Market runs from Saturday at 6:00 through Sunday at 18:00.</p>' : '<p class="hint">More calendar notes may appear as the town trusts you with stranger schedules.</p>'}
-  `;
+  <p class="hint">${calendarLabelForIndex(snap.weekIndex)} · ${String(snap.hour).padStart(2, '0')}:${String(snap.minute).padStart(2, '0')}</p>
+  <div class="calendar-grid ${unlocked ? 'has-fae-days' : ''}">
+    ${HUMAN_WEEK_DAYS.map((day, index) => `
+      <div class="calendar-day ${index === snap.weekIndex ? 'is-today' : ''}">
+        <b>${escapeHtml(day)}</b>
+        ${unlocked ? `<span>${escapeHtml(FAE_WEEK_DAYS[index])}</span>` : ''}
+      </div>
+    `).join('')}
+  </div>
+  ${unlocked
+    ? '<p class="hint">The Fae Market runs from Saturday at 6:00 through Sunday at 18:00.</p>'
+    : ''
+  }
+  <p class="hint">More calendar notes will appear as you earn the trust of the town.</p>
+`;
   modal.classList.add('is-open');
   document.body.classList.add('modal-open');
 }
@@ -3556,7 +5403,12 @@ function renderClock() {
   if (!snap) return;
   const dayLabel = $('#dayLabel');
   if (dayLabel) {
-    dayLabel.innerHTML = `${renderIcon(calendarIcon(), 'calendar-label-icon')} Year ${escapeHtml(snap.year)}, Day ${escapeHtml(snap.day)} · ${escapeHtml(calendarLabelForIndex(snap.weekIndex))} · ${escapeHtml(String(snap.hour).padStart(2, '0'))}:${escapeHtml(String(snap.minute).padStart(2, '0'))}`;
+    // Show day name + optional fae day (when unlocked) + time. Year and day number are
+    // tracked in state for future use but not shown in the top bar.
+    const humanDay = HUMAN_WEEK_DAYS[snap.weekIndex] || 'Day';
+    const faeDay   = hasUnlockKey('location_market') ? ` · ${FAE_WEEK_DAYS[snap.weekIndex] || 'Fae Day'}` : '';
+    const timeStr  = `${String(snap.hour).padStart(2, '0')}:${String(snap.minute).padStart(2, '0')}`;
+    dayLabel.innerHTML = `${renderIcon(calendarIcon(), 'calendar-label-icon')} ${escapeHtml(humanDay)}${escapeHtml(faeDay)} · ${escapeHtml(timeStr)}`;
   }
   const orb = $('#dayOrb');
   if (orb) {
@@ -3573,6 +5425,49 @@ function renderTools() {
   const grid = $('#toolGrid');
   if (!grid) return;
   grid.innerHTML = '';
+
+  // Ornamental garden: show pots + watering can only
+  if (state?.garden?.garden_type_code === 'ornamental') {
+    const potTypes = state.ornamental_pot_types || [];
+    for (const pt of potTypes) {
+      const invItem = (state.inventory || []).find(i => Number(i.item_id) === Number(pt.item_id));
+      const owned = invItem ? Number(invItem.quantity) : 0;
+      if (owned <= 0) continue;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      const isSelected = selectedMode.type === 'pot' && Number(selectedMode.value) === Number(pt.pot_type_id);
+      btn.className = `icon-card${isSelected ? ' selected' : ''}`;
+      btn.innerHTML = `${renderIcon(pt.icon || invItem?.icon || '🪴', 'big-icon')}<b class="qty-badge">×${owned}</b>`;
+      bindTooltip(btn, `<b>${escapeHtml(pt.name)}</b><br><span class="muted-line">${escapeHtml(pt.pot_size)} pot</span><br><span class="muted-line">Owned ×${owned}</span>`);
+      btn.addEventListener('click', () => { selectedMode = { type: 'pot', value: Number(pt.pot_type_id) }; render(); });
+      grid.appendChild(btn);
+    }
+    // Watering can
+    const waterTool = getTool('watering_can');
+    if (waterTool) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `icon-card${selectedMode.type === 'tool' && selectedMode.value === 'watering_can' ? ' selected' : ''}`;
+      btn.innerHTML = renderIcon(waterTool.icon, 'big-icon');
+      bindTooltip(btn, `<b>${escapeHtml(waterTool.name)}</b><br><span class="muted-line">Water ornamental plants.</span>`);
+      btn.addEventListener('click', () => { selectedMode = { type: 'tool', value: 'watering_can' }; render(); });
+      grid.appendChild(btn);
+    }
+    // Shovel — dig up a plant or remove an empty pot
+    const shovelTool = getTool('shovel');
+    if (shovelTool) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `icon-card${selectedMode.type === 'tool' && selectedMode.value === 'shovel' ? ' selected' : ''}`;
+      btn.innerHTML = renderIcon(shovelTool.icon, 'big-icon');
+      bindTooltip(btn, `<b>${escapeHtml(shovelTool.name)}</b><br><span class="muted-line">Dig up a plant, or remove an empty pot.</span>`);
+      btn.addEventListener('click', () => { selectedMode = { type: 'tool', value: 'shovel' }; render(); });
+      grid.appendChild(btn);
+    }
+    return;
+  }
+
+  // Regular garden tools
   for (const tool of state.tools || []) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -3599,19 +5494,42 @@ function renderTools() {
   grid.appendChild(info);
 }
 
+function plantAllowedInCurrentGarden(plant) {
+  const garden = state?.garden;
+  if (!garden) return true;
+  const gardenTypeId = Number(garden.garden_type_id);
+  const gardenTypeCode = String(garden.garden_type_code || 'farm');
+  const raw = plant.allowed_garden_types_json;
+  if (raw !== null && raw !== undefined && raw !== '') {
+    let allowed;
+    try { allowed = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { allowed = null; }
+    if (Array.isArray(allowed)) {
+      if (allowed.some(v => Number(v) === 0)) return true;
+      if (gardenTypeId > 0 && allowed.some(v => Number(v) === gardenTypeId)) return true;
+      if (allowed.some(v => v === gardenTypeCode)) return true;
+      return false;
+    }
+  }
+  const legacy = String(plant.allowed_garden_type_code || 'farm');
+  return legacy === 'all' || legacy === '0' || legacy === gardenTypeCode;
+}
+
 function renderSeeds() {
   const grid = $('#seedGrid');
   if (!grid) return;
   grid.innerHTML = '';
   for (const plant of state.plants || []) {
     const owned = countInventoryByItemId(plant.seed_item_id);
+    if (owned <= 0) continue;
+    const canGrowHere = plantAllowedInCurrentGarden(plant);
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = `icon-card ${selectedMode.type === 'seed' && Number(selectedMode.value) === Number(plant.plant_id) ? 'selected' : ''}`;
-    btn.disabled = owned <= 0;
+    const isSelected = selectedMode.type === 'seed' && Number(selectedMode.value) === Number(plant.plant_id);
+    btn.className = `icon-card${isSelected ? ' selected' : ''}${!canGrowHere ? ' wrong-garden' : ''}`;
     btn.innerHTML = `${renderIcon(plant.seed_icon, 'big-icon')}<b class="qty-badge">×${owned}</b>`;
-    const allowed = plant.allowed_garden_type_names || plant.allowed_garden_types_label || plant.allowed_garden_type_code || '';
-    bindTooltip(btn, `<b>${escapeHtml(plant.name)}</b><br><span class="muted-line">${plant.width}×${plant.height}</span><br><span class="muted-line">Owned ×${owned}</span>${allowed ? `<br><span class="muted-line">Garden: ${escapeHtml(allowed)}</span>` : ''}`);
+    const gardenLabel = plant.allowed_garden_type_names || plant.allowed_garden_types_label || plant.allowed_garden_type_code || '';
+    const wrongGardenNote = !canGrowHere ? '<br><span style="color:#e05050">Can\'t grow in this garden.</span>' : '';
+    bindTooltip(btn, `<b>${escapeHtml(plant.name)}</b><br><span class="muted-line">${plant.width}×${plant.height}</span><br><span class="muted-line">Owned ×${owned}</span>${gardenLabel ? `<br><span class="muted-line">Garden: ${escapeHtml(gardenLabel)}</span>` : ''}${wrongGardenNote}`);
     btn.addEventListener('click', () => { selectedMode = { type: 'seed', value: Number(plant.plant_id) }; render(); });
     grid.appendChild(btn);
   }
@@ -3730,7 +5648,7 @@ function renderShed() {
     }
     if (!state.machines?.length) machines.innerHTML = '<p class="hint">The shed echoes. Dramatically. Buy a preserves bin to unlock your workspace.</p>'; 
   }
-  if (list) list.innerHTML = '<p class="hint">Processing canvas coming soon.</p>';
+//  if (list) list.innerHTML = '<p class="hint">Processing canvas coming soon.</p>';
 }
 
 function renderLocations() {
@@ -4024,7 +5942,9 @@ function render() {
   setTextIfExists('#recognitionCount', state.progress?.recognition ?? state.user?.recognition ?? 0);
   setIconHtml($('#recognitionIcon'), recognitionIcon(), 'header-stat-icon');
   setTextIfExists('#gardenName', `${state.garden.name} — ${state.garden.garden_type_name}`);
-  if (!$('#versionPill')?.dataset.loadedVersion) { const vp = $('#versionPill'); if (vp) { vp.dataset.loadedVersion = loadedAppVersion || state.version || 'v0.4.16'; vp.textContent = vp.dataset.loadedVersion; } }
+  renderGardenTabs();
+  renderOrnamentalOverlay();
+  if (!$('#versionPill')?.dataset.loadedVersion) { const vp = $('#versionPill'); if (vp) { vp.dataset.loadedVersion = loadedAppVersion || state.version || 'v???'; vp.textContent = vp.dataset.loadedVersion; } }
   setTextIfExists('#mapPanelTitle', state.map_config?.title || 'Town');
   renderClock();
   renderOrdersButton();
@@ -4154,6 +6074,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateCanvasCursor();
     hideTooltip();
   });
+  document.body.dataset.screen = activeScreen; // initialise CSS gate (defaults to 'map')
   setSaveStatus('saved', 'Everything is synced.');
   fetchState();
   requestAnimationFrame(draw);

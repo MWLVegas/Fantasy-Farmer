@@ -132,9 +132,9 @@ function getGameClock(mysqli $db, int $userId): array
     ];
 }
 
-function cycleIndexForElapsedHours(float $elapsedHours, int $cycleHour): int
+function cycleIndexForElapsedHours(float $elapsedHours, int $cycleHour, int $cycleLengthHours = 24): int
 {
-    return (int) floor(($elapsedHours - $cycleHour) / 24);
+    return (int) floor(($elapsedHours - $cycleHour) / max(1, $cycleLengthHours));
 }
 
 function ensurePlayerDefaults(mysqli $db, int $userId): void
@@ -268,7 +268,7 @@ function processGrowth(mysqli $db, int $userId): void
     $elapsedGameHours = (float) $clock['total_game_hours_elapsed'];
 
     $stmt = $db->prepare("
-        SELECT pc.*, {$cyclesSql} AS growth_steps, p.cycle_hour, p.water_required, p.water_drain_per_game_hour,
+        SELECT pc.*, {$cyclesSql} AS growth_steps, p.cycle_hour, COALESCE(p.cycle_length_hours, 24) AS cycle_length_hours, p.water_required, p.water_drain_per_game_hour,
                COALESCE(problems.problem_count, 0) AS problem_count
         FROM planted_crops pc
         JOIN plants p ON p.plant_id = pc.plant_id
@@ -292,7 +292,7 @@ function processGrowth(mysqli $db, int $userId): void
 
         $step = (int) $crop['growth_step_current'];
         $lastCycle = (int) $crop['last_cycle_index'];
-        $currentCycle = cycleIndexForElapsedHours($elapsedGameHours, (int) $crop['cycle_hour']);
+        $currentCycle = cycleIndexForElapsedHours($elapsedGameHours, (int) $crop['cycle_hour'], (int) $crop['cycle_length_hours']);
 
         if ($currentCycle > $lastCycle && $water >= (int) $crop['water_required'] && (int)($crop['problem_count'] ?? 0) === 0 && !(int) $crop['has_weeds'] && !(int) $crop['has_pests']) {
             $advance = min($currentCycle - $lastCycle, (int) $crop['growth_steps'] - $step);
@@ -369,7 +369,7 @@ function processHelperAutomation(mysqli $db, int $userId): void
                 SELECT pc.planted_crop_id, pc.origin_x, pc.origin_y
                 FROM planted_crops pc
                 JOIN plants p ON p.plant_id = pc.plant_id
-                WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0
+                WHERE pc.user_id = ? AND pc.is_harvested = 0
                   AND pc.water_current < p.water_max
                   AND pc.growth_step_current < {$cyclesSql}
                   AND pc.has_weeds = 0
@@ -378,7 +378,7 @@ function processHelperAutomation(mysqli $db, int $userId): void
                 ORDER BY (pc.water_current / NULLIF(p.water_max, 0)) ASC, pc.planted_crop_id ASC
                 LIMIT 1
             " );
-            $stmt->bind_param('ii', $userId, $gardenId);
+            $stmt->bind_param('i', $userId);
             $stmt->execute();
             $crop = $stmt->get_result()->fetch_assoc();
             if ($crop) {
@@ -625,6 +625,66 @@ function ensureRescuePouch(mysqli $db, int $userId, int $gardenId): void
 }
 
 
+function ensureFaeOffering(mysqli $db, int $userId, int $gardenId): void
+{
+    // Guard: migration may not have been applied yet
+    if (!columnExists($db, 'player_pouches', 'pouch_type')) return;
+
+    // Count fully grown plants in this garden
+    $cyclesSql = plantCyclesSql($db, 'p');
+    $stmt = $db->prepare("
+        SELECT COUNT(*) AS c
+        FROM planted_crops pc
+        JOIN plants p ON p.plant_id = pc.plant_id
+        WHERE pc.user_id = ? AND pc.garden_id = ? AND pc.is_harvested = 0
+          AND pc.growth_step_current >= {$cyclesSql}
+    ");
+    $stmt->bind_param('ii', $userId, $gardenId);
+    $stmt->execute();
+    $matureCount = (int)($stmt->get_result()->fetch_assoc()['c'] ?? 0);
+    if ($matureCount === 0) return;
+
+    // Don't stack — one collectible at a time
+    $stmt = $db->prepare("SELECT pouch_id FROM player_pouches WHERE user_id = ? AND is_claimed = 0 LIMIT 1");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    if ($stmt->get_result()->fetch_assoc()) return;
+
+    // Once per game-day interval (separate from farm seed pouch timer)
+    $config = getGameConfig($db);
+    $dayLength = max(60, (int)($config['day_length_seconds'] ?? 720));
+    $useLastFaeColumn = columnExists($db, 'player_state', 'last_fae_offering_at');
+    $lastCol = $useLastFaeColumn ? 'last_fae_offering_at' : 'last_pouch_at';
+    $stmt = $db->prepare("SELECT {$lastCol} AS last_at FROM player_state WHERE user_id = ? LIMIT 1");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $last = ($row && $row['last_at']) ? strtotime($row['last_at']) : 0;
+    if (time() - $last < $dayLength) return;
+
+    // 50% chance per mature plant; update timer regardless so we don't re-roll every page load
+    $count = 0;
+    for ($i = 0; $i < $matureCount; $i++) {
+        if (random_int(0, 1) === 1) $count++;
+    }
+    $updateCol = $useLastFaeColumn ? 'last_fae_offering_at' : 'last_pouch_at';
+    $stmt = $db->prepare("UPDATE player_state SET {$updateCol} = NOW() WHERE user_id = ?");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+
+    if ($count === 0) return;
+    $count = min($count, 5);
+
+    $x = random_int(1200, 8800) / 10000;
+    $y = random_int(1200, 8800) / 10000;
+    $stmt = $db->prepare("
+        INSERT INTO player_pouches (user_id, garden_id, x_ratio, y_ratio, seed_count, pouch_type, visual_state, visible_at)
+        VALUES (?, ?, ?, ?, ?, 'fae_offering', 'arriving', NOW())
+    ");
+    $stmt->bind_param('iiddi', $userId, $gardenId, $x, $y, $count);
+    $stmt->execute();
+}
+
 function randomOrderCode(): string
 {
     $alphabet = ['ᚠ','ᚢ','ᚦ','ᚨ','ᚱ','ᚲ','ᚷ','ᚹ','ᛃ','ᛈ','ᛉ','ᛟ'];
@@ -682,8 +742,22 @@ function grantUnlock(mysqli $db, int $userId, string $unlockKey, string $source 
 
 function ensureStartingUnlocks(mysqli $db, int $userId): void
 {
-    foreach (['location_map','location_garden','location_shop','orders_board','location_caravan'] as $key) {
-        grantUnlock($db, $userId, $key, 'starting_state');
+    // location_map is always granted (used internally even though there's no map_location_config row for it)
+    grantUnlock($db, $userId, 'location_map', 'starting_state');
+
+    // Grant unlocks for every location flagged as default-unlocked in the database
+    if (tableExists($db, 'map_location_config') && columnExists($db, 'map_location_config', 'is_unlocked_by_default')) {
+        $res = $db->query("SELECT unlock_key FROM map_location_config WHERE is_unlocked_by_default = 1 AND is_active = 1 AND unlock_key IS NOT NULL AND unlock_key <> ''");
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                grantUnlock($db, $userId, (string)$row['unlock_key'], 'starting_state');
+            }
+        }
+    } else {
+        // Fallback until migration is applied
+        foreach (['location_garden', 'location_shop', 'orders_board', 'location_caravan'] as $key) {
+            grantUnlock($db, $userId, $key, 'starting_state');
+        }
     }
 }
 
@@ -716,6 +790,15 @@ function cleanupDeadOrders(mysqli $db, int $userId): void
 {
     if (!tableExists($db, 'player_orders')) return;
     $stmt = $db->prepare("DELETE FROM player_orders WHERE user_id = ? AND (order_status IN ('expired','cancelled') OR is_expired = 1 OR (order_status = 'available' AND expires_at < NOW()))");
+    if (!$stmt) return;
+    $stmt->bind_param('i', $userId);
+    @$stmt->execute();
+}
+
+function cleanupClaimedPouches(mysqli $db, int $userId): void
+{
+    // player_pouches is a queue, not a log. Claimed rows should not accumulate.
+    $stmt = $db->prepare("DELETE FROM player_pouches WHERE user_id = ? AND is_claimed = 1");
     if (!$stmt) return;
     $stmt->bind_param('i', $userId);
     @$stmt->execute();
@@ -791,7 +874,13 @@ function ensureActiveOrder(mysqli $db, int $userId): void
 function createRandomOrder(mysqli $db, int $userId): void
 {
     $config = getGameConfig($db);
-    $item = $db->query("SELECT item_id, base_sell_price FROM items WHERE item_type='produce' AND is_active=1 ORDER BY base_sell_price ASC, RAND() LIMIT 1")->fetch_assoc();
+    $progress = getPlayerProgress($db, $userId);
+    $rep = (int)$progress['reputation'];
+    $tier = 0;
+    if ($rep >= 20) $tier = 3;
+    elseif ($rep >= 12) $tier = 2;
+    elseif ($rep >= 5)  $tier = 1;
+    $item = $db->query("SELECT item_id, base_sell_price FROM items WHERE item_type='produce' AND is_active=1 AND COALESCE(order_tier,0) <= {$tier} ORDER BY base_sell_price ASC, RAND() LIMIT 1")->fetch_assoc();
     if (!$item) return;
 
     $qty = random_int(2, 6);
@@ -816,14 +905,9 @@ function createRandomOrder(mysqli $db, int $userId): void
     $code = randomOrderCode();
     $customer = randomOrderCustomerName($db);
 
-    $stmt = $db->prepare("INSERT INTO player_orders (user_id, order_code, customer_name, base_payment_coins, payment_coins, reputation_reward, recognition_reward, order_type, order_status, fulfillment_minutes, expires_at, cancel_reputation_penalty, late_fee_percent) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'available', ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), 1, ?)");
-    $stmt->bind_param('issiiisiii', $userId, $code, $customer, $basePayment, $payment, $reputationReward, $orderType, $fulfillmentMinutes, $boardMinutes, $lateFeePercent);
-    $stmt->execute();
-
-    $orderId = (int)$db->insert_id;
     $itemId = (int)$item['item_id'];
-    $stmt = $db->prepare("INSERT INTO order_items (player_order_id, item_id, quantity_required) VALUES (?, ?, ?)");
-    $stmt->bind_param('iii', $orderId, $itemId, $qty);
+    $stmt = $db->prepare("INSERT INTO player_orders (user_id, order_code, customer_name, base_payment_coins, payment_coins, reputation_reward, recognition_reward, order_type, order_status, fulfillment_minutes, expires_at, cancel_reputation_penalty, late_fee_percent, item_id, quantity_required) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'available', ?, DATE_ADD(NOW(), INTERVAL ? MINUTE), 1, ?, ?, ?)");
+    $stmt->bind_param('issiiisiiiii', $userId, $code, $customer, $basePayment, $payment, $reputationReward, $orderType, $fulfillmentMinutes, $boardMinutes, $lateFeePercent, $itemId, $qty);
     $stmt->execute();
 }
 
@@ -954,7 +1038,19 @@ function eventHasFirstStep(mysqli $db, string $eventKey): bool
 
 function getLocationsForPlayer(mysqli $db, int $userId): array
 {
-    $progress = getPlayerProgress($db, $userId);
+    // Guard: migration may not have run yet
+    if (!tableExists($db, 'map_location_config') || !columnExists($db, 'map_location_config', 'unlock_key')) {
+        return [];
+    }
+
+    $rows = $db->query("
+        SELECT location_key, display_name, hint, unlock_key, is_unlocked_by_default,
+               map_icon, active_map_icon, inactive_map_icon
+        FROM map_location_config
+        WHERE is_active = 1
+        ORDER BY sort_order ASC, map_location_config_id ASC
+    ")->fetch_all(MYSQLI_ASSOC);
+
     $unlocks = [];
     $stmt = $db->prepare("SELECT unlock_key FROM player_unlocks WHERE user_id = ?");
     $stmt->bind_param('i', $userId);
@@ -962,78 +1058,58 @@ function getLocationsForPlayer(mysqli $db, int $userId): array
     $res = $stmt->get_result();
     while ($row = $res->fetch_assoc()) $unlocks[$row['unlock_key']] = true;
 
-    $defs = [
-        ['key'=>'garden','name'=>'Garden','icon'=>'assets/map/garden.png','unlock'=>'location_garden','hint'=>'Your growing field.'],
-        ['key'=>'shop','name'=>'General Store','icon'=>'assets/map/store.png','unlock'=>'location_shop','hint'=>'Basic seeds, tools, and a weekly special.'],
-        ['key'=>'orders','name'=>'Orders Board','icon'=>'assets/map/orders.png','unlock'=>'orders_board','hint'=>'Requests from townsfolk.'],
-        ['key'=>'shed','name'=>'Workroom / Shed','icon'=>'assets/map/shed.png','unlock'=>'location_shed','hint'=>'Processing and equipment live here.'],
-        ['key'=>'market','name'=>'Fae Market','icon'=>'assets/map/market.png','unlock'=>'location_market','hint'=>'Unlocks after the shopkeeper invitation.'],
-        ['key'=>'caravan','name'=>'Caravan Camp','icon'=>'assets/map/caravan_empty.png','unlock'=>'location_caravan','hint'=>'Unlocked by relic-driven visitor events.'],
-        ['key'=>'bone_brine','name'=>'Bone & Brine','icon'=>'assets/map/bone_brine.png','unlock'=>'location_bone_brine','hint'=>'Permanent oddities stall after their relic event.'],
-        ['key'=>'helpers','name'=>'Forest Folk','icon'=>'assets/map/fairy_folk.png','unlock'=>'helpers_unlocked','hint'=>'Summoned helpers using bells and equipped amulets.'],
-    ];
-
-    $marketStatus = getMarketStatus($db, $userId);
+    $progress   = getPlayerProgress($db, $userId);
+    $marketStatus  = getMarketStatus($db, $userId);
     $caravanStatus = getCaravanStatus($db, $userId);
-    $mapConfigForLocations = getMapConfig($db);
-    $locationMarkersForLocations = $mapConfigForLocations['location_markers'] ?? [];
 
-    $locationAliases = [
-        'shop' => ['shop', 'store', 'general_store'],
-        'helpers' => ['helpers', 'forest_folk'],
-        'market' => ['market', 'fae_market'],
-        'bone_brine' => ['bone_brine', 'bone_brine_shop'],
-        'shed' => ['shed', 'workroom'],
-    ];
+    $locations = [];
+    foreach ($rows as $row) {
+        $key       = (string)$row['location_key'];
+        $unlockKey = $row['unlock_key'] !== null ? (string)$row['unlock_key'] : null;
+        $unlocked  = $unlockKey === null || !empty($unlocks[$unlockKey]);
 
-    foreach ($defs as &$def) {
-        $markerForDef = [];
-        foreach (($locationAliases[$def['key']] ?? [$def['key']]) as $markerKey) {
-            if (!empty($locationMarkersForLocations[$markerKey])) {
-                $markerForDef = $locationMarkersForLocations[$markerKey];
-                break;
-            }
-        }
-        if (!empty($markerForDef['icon'])) {
-            // Location definitions should never fall back to emoji placeholders when
-            // DB-backed map art exists. Locked locations use this same icon and apply
-            // the blackout filter client-side.
-            $def['icon'] = $markerForDef['icon'];
-        }
-        $def['unlocked'] = !empty($unlocks[$def['unlock']]);
-        $def['disabled'] = false;
-        if ($def['key'] === 'caravan') {
+        $def = [
+            'key'      => $key,
+            'name'     => (string)($row['display_name'] ?: $key),
+            'icon'     => (string)($row['map_icon'] ?? ''),
+            'hint'     => (string)($row['hint'] ?? ''),
+            'unlocked' => $unlocked,
+            'disabled' => false,
+        ];
+
+        // ---- Per-location dynamic enrichment ----
+
+        if ($key === 'caravan') {
             $def['caravan_status'] = $caravanStatus;
-            $caravanMarker = $locationMarkersForLocations['caravan'] ?? [];
-            $inactiveIcon = $caravanMarker['inactive_map_icon'] ?? $caravanMarker['icon'] ?? $def['icon'];
-            $activeIcon = $caravanMarker['active_map_icon'] ?? $inactiveIcon;
-            $def['icon'] = !empty($caravanStatus['is_active']) ? $activeIcon : $inactiveIcon;
-            if ($def['unlocked'] && empty($caravanStatus['is_active'])) {
+            $inactiveIcon = $row['inactive_map_icon'] ?: ($row['map_icon'] ?? '');
+            $activeIcon   = $row['active_map_icon']  ?: $inactiveIcon;
+            $def['icon']  = !empty($caravanStatus['is_active']) ? $activeIcon : $inactiveIcon;
+            if ($unlocked && empty($caravanStatus['is_active'])) {
                 $def['hint'] = 'The caravan camp is empty right now.';
-            } elseif ($def['unlocked'] && !empty($caravanStatus['bone_brine_ready'])) {
+            } elseif ($unlocked && !empty($caravanStatus['bone_brine_ready'])) {
                 $def['hint'] = 'A Bone & Brine caravan is waiting at the camp.';
-            } elseif ($def['unlocked']) {
+            } elseif ($unlocked) {
                 $def['hint'] = 'The caravan has arrived with temporary visitors.';
             }
         }
 
-        if ($def['key'] === 'market') {
-            $def['is_open'] = (bool)$marketStatus['is_open'];
+        if ($key === 'market') {
+            $def['is_open']      = (bool)$marketStatus['is_open'];
             $def['market_status'] = $marketStatus;
-            if ($def['unlocked'] && !$marketStatus['is_open']) {
+            if ($unlocked && !$marketStatus['is_open']) {
                 $def['disabled'] = true;
                 $def['hint'] = 'The Fae Market is not open right now.';
-            } elseif ($def['unlocked']) {
+            } elseif ($unlocked) {
                 $def['hint'] = 'The Fae Market is open. They buy crops, seeds, weeds, bugs, and other oddities.';
             } elseif ($progress['reputation'] >= 10) {
-                // Reputation creates a shop event marker; accepting that event grants location_market.
-                $def['can_unlock'] = false;
                 $def['hint'] = 'The shopkeeper may have something to say at the General Store.';
             }
         }
+
+        $locations[] = $def;
     }
-    unset($def);
-    return $defs;
+
+    return $locations;
 }
 
 function maybeGrantMarketInvite(mysqli $db, int $userId): void
@@ -1042,33 +1118,98 @@ function maybeGrantMarketInvite(mysqli $db, int $userId): void
     // It now creates a location-driven event marker handled by getLocationEvents().
 }
 
+function evaluateTriggerConditions(mysqli $db, int $userId, ?string $conditionsJson, array $context = []): bool
+{
+    if (!$conditionsJson) return true;
+    $conds = json_decode($conditionsJson, true);
+    if (!is_array($conds)) return true;
+
+    foreach (($conds['flags'] ?? []) as $key => $required) {
+        $has = hasUnlock($db, $userId, (string)$key);
+        if ((bool)$required !== $has) return false;
+    }
+
+    if (isset($conds['min_reputation'])) {
+        $rep = $context['reputation'] ?? null;
+        if ($rep === null) { $p = getPlayerProgress($db, $userId); $rep = $p['reputation']; }
+        if ((int)$rep < (int)$conds['min_reputation']) return false;
+    }
+
+    if (isset($conds['min_recognition'])) {
+        $rec = $context['recognition'] ?? null;
+        if ($rec === null) { $p = getPlayerProgress($db, $userId); $rec = $p['recognition']; }
+        if ((int)$rec < (int)$conds['min_recognition']) return false;
+    }
+
+    if (!empty($conds['caravan_active']) && empty($context['caravan_active'])) return false;
+    if (!empty($conds['caravan_bone_brine_ready']) && empty($context['caravan_bone_brine_ready'])) return false;
+
+    if (!empty($conds['inventory_has'])) {
+        foreach ($conds['inventory_has'] as $code => $qty) {
+            $stmt = $db->prepare("SELECT COALESCE(inv.quantity, 0) AS q FROM items i LEFT JOIN player_inventory inv ON inv.item_id = i.item_id AND inv.user_id = ? WHERE i.code = ? LIMIT 1");
+            $stmt->bind_param('is', $userId, $code);
+            $stmt->execute();
+            $row = $stmt->get_result()->fetch_assoc();
+            if (!$row || (int)$row['q'] < (int)$qty) return false;
+        }
+    }
+
+    return true;
+}
+
 function getLocationEvents(mysqli $db, int $userId): array
 {
     $events = [];
-    $progress = getPlayerProgress($db, $userId);
-
-    if ($progress['reputation'] >= 10
-        && !hasUnlock($db, $userId, 'location_market')
-        && eventHasFirstStep($db, 'market_shopkeeper_invite')) {
-        $events[] = [
-            'event_key' => 'market_shopkeeper_invite',
-            'location_key' => 'shop',
-            'title' => 'Fae Market Invitation',
-            'tooltip' => 'The shopkeepers have something to tell you.',
-            'icon' => systemIconByCode($db, 'quest_available', '!')
-        ];
+    if (!tableExists($db, 'event_triggers') || !columnExists($db, 'event_triggers', 'location_key')) {
+        return $events;
     }
 
+    $progress = getPlayerProgress($db, $userId);
     $caravanStatus = getCaravanStatus($db, $userId);
-    if (!empty($caravanStatus['is_active'])
-        && !empty($caravanStatus['bone_brine_ready'])
-        && eventHasFirstStep($db, 'bone_brine_caravan_intro')) {
+    $context = [
+        'reputation'               => (int)$progress['reputation'],
+        'recognition'              => (int)$progress['recognition'],
+        'caravan_active'           => !empty($caravanStatus['is_active']),
+        'caravan_bone_brine_ready' => !empty($caravanStatus['bone_brine_ready']),
+    ];
+
+    $stmt = $db->prepare("
+        SELECT et.trigger_id, et.event_id, et.location_key, et.ui_tooltip,
+               et.trigger_conditions_json, et.is_repeatable,
+               e.event_key, e.title AS event_title
+        FROM event_triggers et
+        JOIN events e ON e.event_id = et.event_id
+        WHERE et.trigger_type = 'location'
+          AND et.is_active = 1
+          AND e.is_active = 1
+          AND et.location_key IS NOT NULL
+        ORDER BY et.priority ASC, et.trigger_id ASC
+    ");
+    if (!@$stmt->execute()) return $events;
+    $triggers = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+    foreach ($triggers as $trigger) {
+        $eventKey  = (string)$trigger['event_key'];
+        $locationKey = (string)$trigger['location_key'];
+        $eventId   = (int)$trigger['event_id'];
+
+        if (!eventHasFirstStep($db, $eventKey)) continue;
+
+        // Skip if this event is already active or complete for this player
+        $stmt2 = $db->prepare("SELECT status FROM player_event_state WHERE user_id = ? AND event_id = ? ORDER BY player_event_state_id DESC LIMIT 1");
+        $stmt2->bind_param('ii', $userId, $eventId);
+        $stmt2->execute();
+        $existing = $stmt2->get_result()->fetch_assoc();
+        if ($existing && in_array($existing['status'], ['active', 'complete'], true)) continue;
+
+        if (!evaluateTriggerConditions($db, $userId, $trigger['trigger_conditions_json'] ?? null, $context)) continue;
+
         $events[] = [
-            'event_key' => 'bone_brine_caravan_intro',
-            'location_key' => 'caravan',
-            'title' => 'A Questionable Caravan',
-            'tooltip' => 'A Bone & Brine wagon has arrived after your second strange relic.',
-            'icon' => systemIconByCode($db, 'quest_available', '!')
+            'event_key'   => $eventKey,
+            'location_key' => $locationKey,
+            'title'       => (string)$trigger['event_title'],
+            'tooltip'     => (string)($trigger['ui_tooltip'] ?? 'Something is happening here.'),
+            'icon'        => systemIconByCode($db, 'quest_available', '!')
         ];
     }
 
@@ -1137,9 +1278,39 @@ function maybeFindFirstRelicFromTilling(mysqli $db, int $userId, int $plotId, ar
     return $displayName;
 }
 
+function maybeDropCommonRelic(mysqli $db, int $userId): bool
+{
+    if (random_int(1, 100) > 3) return false;
+    $item = $db->query("SELECT item_id FROM items WHERE code = 'relic_fragment' AND is_active = 1 LIMIT 1")->fetch_assoc();
+    if (!$item) return false;
+    addInventory($db, $userId, (int)$item['item_id'], 1);
+    return true;
+}
+
+function maybeFindSecondRelicFromTilling(mysqli $db, int $userId, int $plotId): bool
+{
+    if (!hasUnlock($db, $userId, 'ornamental_garden_unlocked')) return false;
+    if (hasUnlock($db, $userId, 'second_relic_spawned') || hasUnlock($db, $userId, 'second_relic_collected')) return false;
+    if (random_int(1, 100) > 5) return false;
+
+    $stmt = $db->prepare("SELECT gp.is_tilled FROM garden_plots gp JOIN gardens g ON g.garden_id = gp.garden_id WHERE gp.plot_id = ? AND g.user_id = ? LIMIT 1");
+    $stmt->bind_param('ii', $plotId, $userId);
+    $stmt->execute();
+    $plot = $stmt->get_result()->fetch_assoc();
+    if (!$plot || !(int)$plot['is_tilled']) return false;
+
+    $x = random_int(1800, 8200) / 10000;
+    $y = random_int(1800, 8200) / 10000;
+    $stmt = $db->prepare("INSERT INTO player_relics (user_id, relic_key, display_name, relic_type, source_action, x_ratio, y_ratio, visual_state) VALUES (?, 'second_field_relic', 'Strange Buried Relic', 'rune_vessel', 'till', ?, ?, 'waiting')");
+    $stmt->bind_param('idd', $userId, $x, $y);
+    $stmt->execute();
+    grantUnlock($db, $userId, 'second_relic_spawned', 'till_action');
+    return true;
+}
+
 function getActiveRelicPickup(mysqli $db, int $userId): ?array
 {
-    $stmt = $db->prepare("SELECT * FROM player_relics WHERE user_id = ? AND relic_key = 'first_field_relic' AND collected_at IS NULL ORDER BY relic_id DESC LIMIT 1");
+    $stmt = $db->prepare("SELECT * FROM player_relics WHERE user_id = ? AND relic_key IN ('first_field_relic','second_field_relic') AND collected_at IS NULL ORDER BY discovered_at ASC LIMIT 1");
     $stmt->bind_param('i', $userId);
     @$stmt->execute();
     $row = $stmt->get_result()->fetch_assoc();
@@ -1320,6 +1491,53 @@ function applyEventEffects(mysqli $db, int $userId, ?string $effectsJson): array
 
     if (!empty($effects['unlock_location'])) {
         grantUnlock($db, $userId, 'location_' . (string)$effects['unlock_location'], 'event_effect');
+    }
+
+    if (!empty($effects['garden_type_unlock'])) {
+        $gtCode = (string)$effects['garden_type_unlock'];
+        $stmt = $db->prepare("INSERT IGNORE INTO player_garden_type_unlocks (user_id, garden_type_id, source) SELECT ?, garden_type_id, 'event_effect' FROM garden_types WHERE code = ? AND is_active = 1");
+        $stmt->bind_param('is', $userId, $gtCode);
+        $stmt->execute();
+    }
+
+    if (!empty($effects['create_garden']) && is_array($effects['create_garden'])) {
+        $cfg = $effects['create_garden'];
+        $typeCode = (string)($cfg['garden_type_code'] ?? 'farm');
+        $gardenName = (string)($cfg['name'] ?? 'Garden');
+        $locked = !empty($cfg['locked']) ? 1 : 0;
+        $unlockPlots = max(0, (int)($cfg['unlock_plots'] ?? 4));
+
+        // Only create if user doesn't already have a garden of this type
+        $stmt = $db->prepare("SELECT g.garden_id FROM gardens g JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id WHERE g.user_id = ? AND gt.code = ? LIMIT 1");
+        $stmt->bind_param('is', $userId, $typeCode);
+        $stmt->execute();
+        if (!$stmt->get_result()->fetch_assoc()) {
+            $stmt = $db->prepare("SELECT garden_type_id, COALESCE(max_size, 5) AS max_size FROM garden_types WHERE code = ? AND is_active = 1 LIMIT 1");
+            $stmt->bind_param('s', $typeCode);
+            $stmt->execute();
+            $gtRow = $stmt->get_result()->fetch_assoc();
+            if ($gtRow) {
+                $gardenTypeId = (int)$gtRow['garden_type_id'];
+                $maxSize = max(1, (int)$gtRow['max_size']);
+                $stmt = $db->prepare("INSERT INTO gardens (user_id, garden_type_id, name, is_type_locked, max_width, max_height) VALUES (?, ?, ?, ?, ?, ?)");
+                $stmt->bind_param('iisiii', $userId, $gardenTypeId, $gardenName, $locked, $maxSize, $maxSize);
+                $stmt->execute();
+                $newGardenId = (int)$db->insert_id;
+
+                $stmt = $db->prepare("INSERT INTO garden_plots (garden_id, x_pos, y_pos, is_unlocked, till_progress, is_tilled, unlocked_at) VALUES (?, ?, ?, ?, 0, 0, ?)");
+                $plotCount = 0;
+                for ($py = 1; $py <= $maxSize; $py++) {
+                    for ($px = 1; $px <= $maxSize; $px++) {
+                        $unlocked = ($plotCount < $unlockPlots && $px <= 2 && $py <= 2) ? 1 : 0;
+                        $unlockedAt = $unlocked ? date('Y-m-d H:i:s') : null;
+                        $stmt->bind_param('iiiis', $newGardenId, $px, $py, $unlocked, $unlockedAt);
+                        $stmt->execute();
+                        if ($unlocked) $plotCount++;
+                    }
+                }
+                $result['new_garden_id'] = $newGardenId;
+            }
+        }
     }
 
     if (!empty($effects['summon_helper']) && is_array($effects['summon_helper'])) {

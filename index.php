@@ -7,18 +7,18 @@ $userId = requireLogin();
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fantasy Farmer</title>
-  <link rel="stylesheet" href="assets/css/farm.css?v=0.4.16k">
+  <title>Fairytale Farm</title>
+  <link rel="stylesheet" href="assets/css/farm.css?v=0.4.43a">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark">🌱</div>
-      <div>
-        <h1>Fantasy Farmer</h1>
-        <p class="subtitle">Start with dirt. End with suspiciously magical jam.</p>
-      </div>
-    </div>
+  <img
+    src="assets/header.png"
+    alt="Fairytale Farm"
+    class="brand-logo"
+  >
+</div>
 
     <div class="player-box">
       <a href="logout.php">Logout</a>
@@ -28,9 +28,9 @@ $userId = requireLogin();
   <main class="game-shell">
     <section class="play-panel">
       <div class="day-bar-wrap">
-        <div class="day-label" id="dayLabel">Day 1 · 06:00</div>
+        <div class="day-label" id="dayLabel"></div>
         <div class="day-track">
-          <div class="day-orb" id="dayOrb">☀️</div>
+          <div class="day-orb" id="dayOrb"></div>
         </div>
       </div>
 
@@ -40,17 +40,33 @@ $userId = requireLogin();
           <span class="panel-stat-pill" data-tooltip-html="<b>Reputation</b><br><span class=&quot;muted-line&quot;>Local trust earned from orders.</span>"><span id="reputationIcon" class="header-stat-icon">⭐</span> <b id="reputationCount">0</b></span>
           <span class="panel-stat-pill" data-tooltip-html="<b>Recognition</b><br><span class=&quot;muted-line&quot;>World progress from milestones, relics, and visitors.</span>"><span id="recognitionIcon" class="header-stat-icon">🏵️</span> <b id="recognitionCount">0</b></span>
         </div>
+        <div id="gardenTabsBar" class="garden-tabs-bar" hidden></div>
+
         <div class="field-nav-actions">
-          <button type="button" id="backToMapBtn" class="small-button back-map-button" hidden>🗺️ Map</button>
-          <button type="button" id="inventoryBtn" class="small-button" data-tooltip-html="<b>Inventory</b><br><span class=&quot;muted-line&quot;>Open your backpack.</span>">🎒 Backpack</button>
-          <button type="button" id="ordersBtn" class="small-button orders-button" data-tooltip-html="<b>Orders Board</b><br><span class=&quot;muted-line&quot;>No active orders right now.</span>">📜 Orders: <span id="ordersTimer">0/2</span><b id="ordersBadge" class="order-badge">!</b></button>
+          <button type="button" id="backToMapBtn" class="small-button back-map-button" hidden></button>
+          <button type="button" id="inventoryBtn" class="small-button" data-tooltip-html="<b>Inventory</b><br><span class=&quot;muted-line&quot;>Open your backpack.</span>"></button>
+          <button type="button" id="ordersBtn" class="small-button orders-button" data-tooltip-html="<b>Orders Board</b><br><span class=&quot;muted-line&quot;>No active orders right now.</span>"><span id="ordersTimer"></span><b id="ordersBadge" class="order-badge">!</b></button>
         </div>
       </div>
 
-      <div class="canvas-wrap">
-        <canvas id="gardenCanvas" width="720" height="720"></canvas>
-        <div id="ordersBoardSurface" class="orders-board-surface" hidden></div>
-      </div>
+<div class="canvas-wrap">
+  <div id="initialCanvasLoader" class="initial-canvas-loader">
+    <img
+      src="assets/loading/mossroot_loading.png"
+      alt=""
+      class="initial-canvas-loader-image"
+    >
+    <div class="initial-canvas-loader-card">
+      <div class="initial-canvas-loader-title">Loading Mossroot Hollow...</div>
+      <div class="initial-canvas-loader-subtitle">Waking the garden sprites</div>
+    </div>
+  </div>
+
+  <canvas id="gardenCanvas" width="720" height="720"></canvas>
+  <div id="ornamentalOverlay" class="ornamental-overlay" hidden></div>
+  <div id="ordersBoardSurface" class="orders-board-surface" hidden></div>
+</div>
+
     </section>
 
     <aside class="side-panel">
@@ -138,7 +154,13 @@ $userId = requireLogin();
         <h2 id="storyTitle">Story</h2>
         <button type="button" id="storyCloseBtn" class="modal-close" data-close-modal hidden>×</button>
       </div>
-      <div id="storyContent" class="story-content"></div>
+      <div class="story-body-wrap">
+        <div id="storyPortrait" class="story-portrait-col" hidden>
+          <img id="storyPortraitImg" src="" alt="">
+          <div id="storyPortraitName" class="story-speaker-name"></div>
+        </div>
+        <div id="storyContent" class="story-content"></div>
+      </div>
       <div class="story-actions">
         <button type="button" id="storyNextBtn" class="button primary">Okay</button>
       </div>
@@ -153,6 +175,6 @@ $userId = requireLogin();
   <script>
     window.GAME_VERSION = <?= json_encode(getAppVersion($db)) ?>;
   </script>
-  <script src="assets/js/farm.js?v=0.4.28"></script>
+  <script src="assets/js/farm.js?v=0.4.43a"></script>
 </body>
 </html>

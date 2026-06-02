@@ -5,8 +5,11 @@ $userId = requireLogin();
 ensurePlayerDefaults($db, $userId);
 ensureActiveOrder($db, $userId);
 cleanupDeadOrders($db, $userId);
+cleanupClaimedPouches($db, $userId);
 processGrowth($db, $userId);
 processHelperAutomation($db, $userId);
+
+$requestedGardenId = isset($_GET['garden_id']) ? (int)$_GET['garden_id'] : 0;
 
 $stmt = $db->prepare("SELECT user_id, display_name, coins, energy FROM users WHERE user_id = ? LIMIT 1");
 $stmt->bind_param('i', $userId);
@@ -18,17 +21,43 @@ $gardenNightBgSelect = columnExists($db, 'garden_types', 'night_background_image
 $plantCyclesSelect = columnExists($db, 'plants', 'max_cycles') ? 'p.max_cycles' : 'p.growth_steps';
 $seedShopRowIconSelect = columnExists($db, 'items', 'shop_row_icon') ? 'i.shop_row_icon AS seed_shop_row_icon' : 'NULL AS seed_shop_row_icon';
 
-$stmt = $db->prepare("
-    SELECT g.*, gt.code AS garden_type_code, gt.name AS garden_type_name, gt.icon AS garden_type_icon, {$gardenDayBgSelect}, {$gardenNightBgSelect}
-    FROM gardens g
-    JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id
-    WHERE g.user_id = ?
-    ORDER BY g.garden_id ASC
-    LIMIT 1
-");
-$stmt->bind_param('i', $userId);
+if ($requestedGardenId > 0) {
+    $stmt = $db->prepare("
+        SELECT g.*, gt.code AS garden_type_code, gt.name AS garden_type_name, gt.icon AS garden_type_icon, {$gardenDayBgSelect}, {$gardenNightBgSelect}
+        FROM gardens g
+        JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id
+        WHERE g.user_id = ? AND g.garden_id = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param('ii', $userId, $requestedGardenId);
+} else {
+    $stmt = $db->prepare("
+        SELECT g.*, gt.code AS garden_type_code, gt.name AS garden_type_name, gt.icon AS garden_type_icon, {$gardenDayBgSelect}, {$gardenNightBgSelect}
+        FROM gardens g
+        JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id
+        WHERE g.user_id = ?
+        ORDER BY g.garden_id ASC
+        LIMIT 1
+    ");
+    $stmt->bind_param('i', $userId);
+}
 $stmt->execute();
 $garden = $stmt->get_result()->fetch_assoc();
+
+// Fall back to first garden if the requested one doesn't belong to this user
+if (!$garden) {
+    $stmt = $db->prepare("
+        SELECT g.*, gt.code AS garden_type_code, gt.name AS garden_type_name, gt.icon AS garden_type_icon, {$gardenDayBgSelect}, {$gardenNightBgSelect}
+        FROM gardens g
+        JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id
+        WHERE g.user_id = ?
+        ORDER BY g.garden_id ASC
+        LIMIT 1
+    ");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $garden = $stmt->get_result()->fetch_assoc();
+}
 
 $gardenId = (int) $garden['garden_id'];
 
@@ -60,7 +89,12 @@ if (tableExists($db, 'player_garden_type_unlocks')) {
     $unlockedGardenTypes = $db->query("SELECT * FROM garden_types WHERE code = 'farm' AND is_active = 1")->fetch_all(MYSQLI_ASSOC);
 }
 
-ensureRescuePouch($db, $userId, $gardenId);
+$isOrnamental = ($garden['garden_type_code'] ?? 'farm') === 'ornamental';
+if ($isOrnamental) {
+    ensureFaeOffering($db, $userId, $gardenId);
+} else {
+    ensureRescuePouch($db, $userId, $gardenId);
+}
 
 $db->query("UPDATE player_pouches SET visual_state = 'waiting' WHERE is_claimed = 0 AND visual_state = 'arriving' AND TIMESTAMPDIFF(SECOND, visible_at, NOW()) >= 2");
 
@@ -70,7 +104,9 @@ $stmt->execute();
 $plots = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->prepare("
-    SELECT pc.*, p.name, p.code, p.width, p.height, {$plantCyclesSelect} AS growth_steps, p.cycle_hour, p.water_max, p.water_required,
+    SELECT pc.*, p.name, p.code, p.width, p.height, {$plantCyclesSelect} AS growth_steps, p.cycle_hour,
+           COALESCE(p.cycle_length_hours, 24) AS cycle_length_hours,
+           p.water_max, p.water_required,
            p.harvest_min, p.harvest_max, hi.icon AS mature_icon, si.icon AS seed_icon, p.harvest_item_id,
            COALESCE(problem_counts.weed_count, 0) AS weed_count,
            COALESCE(problem_counts.pest_count, 0) AS pest_count
@@ -93,7 +129,9 @@ $crops = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->query("
     SELECT p.plant_id, p.code, p.name, p.width, p.height, {$plantCyclesSelect} AS growth_steps, p.water_max, p.harvest_min, p.harvest_max,
-           {$plantCyclesSelect} AS max_cycles, p.allowed_garden_type_code, p.allowed_garden_types_json, hi.icon AS mature_icon, i.icon AS seed_icon, {$seedShopRowIconSelect}, p.seed_item_id, i.base_buy_price, i.name AS seed_name
+           {$plantCyclesSelect} AS max_cycles, p.allowed_garden_type_code, p.allowed_garden_types_json,
+           COALESCE(p.cycle_length_hours, 24) AS cycle_length_hours,
+           hi.icon AS mature_icon, i.icon AS seed_icon, {$seedShopRowIconSelect}, p.seed_item_id, i.base_buy_price, i.name AS seed_name
     FROM plants p
     JOIN items i ON i.item_id = p.seed_item_id
     JOIN items hi ON hi.item_id = p.harvest_item_id
@@ -207,19 +245,28 @@ $allMachines = $stmt->fetch_all(MYSQLI_ASSOC);
 $allTools = $db->query("SELECT * FROM tools WHERE is_active = 1 ORDER BY tool_type, level ASC")->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->query("
-    SELECT r.*, ii.name AS input_name, ii.icon AS input_icon, oi.name AS output_name, oi.icon AS output_icon
-    FROM processing_recipes r
+    SELECT r.*,
+           COALESCE(r.output_min, r.output_quantity, 1) AS output_min,
+           COALESCE(r.output_max, r.output_quantity, 1) AS output_max,
+           COALESCE(r.cycle_count, 1) AS cycle_count,
+           COALESCE(r.cycle_hours, 12) AS cycle_hours,
+           ii.name AS input_name, ii.icon AS input_icon,
+           oi.name AS output_name, oi.icon AS output_icon
+    FROM machine_recipes r
     JOIN items ii ON ii.item_id = r.input_item_id
     JOIN items oi ON oi.item_id = r.output_item_id
     WHERE r.is_active = 1
-    ORDER BY r.machine_type, oi.name
+    ORDER BY r.machine_type, r.sort_order, oi.name
 ");
 $recipes = $stmt->fetch_all(MYSQLI_ASSOC);
 
 $stmt = $db->prepare("
-    SELECT j.*, r.machine_type, r.output_item_id, r.output_quantity, oi.name AS output_name, oi.icon AS output_icon
+    SELECT j.*, r.machine_type, r.output_item_id,
+           COALESCE(r.output_min, r.output_quantity, 1) AS output_min,
+           COALESCE(r.output_max, r.output_quantity, 1) AS output_max,
+           oi.name AS output_name, oi.icon AS output_icon
     FROM processing_jobs j
-    JOIN processing_recipes r ON r.recipe_id = j.recipe_id
+    JOIN machine_recipes r ON r.recipe_id = j.recipe_id
     JOIN items oi ON oi.item_id = r.output_item_id
     WHERE j.user_id = ? AND j.is_collected = 0
     ORDER BY j.finishes_at ASC
@@ -234,7 +281,16 @@ $stmt = $db->prepare("SELECT pw.*, wt.name, wt.worker_role, wt.icon, wt.cost_per
 $stmt->bind_param('i', $userId); $stmt->execute(); $workers = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 $stmt = $db->prepare("SELECT * FROM player_worker_plant_order WHERE user_id = ? ORDER BY sort_order ASC");
 $stmt->bind_param('i', $userId); $stmt->execute(); $plantOrder = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-$stmt = $db->prepare("SELECT * FROM player_orders WHERE user_id = ? AND order_status IN ('available','accepted') AND is_fulfilled = 0 ORDER BY FIELD(order_status, 'accepted', 'available'), expires_at ASC, player_order_id ASC");
+$stmt = $db->prepare("
+    SELECT po.*,
+           i.name AS item_name, i.icon AS item_icon, i.code AS item_code,
+           COALESCE(inv.quantity, 0) AS owned_quantity
+    FROM player_orders po
+    LEFT JOIN items i ON i.item_id = po.item_id
+    LEFT JOIN player_inventory inv ON inv.item_id = po.item_id AND inv.user_id = po.user_id
+    WHERE po.user_id = ? AND po.order_status IN ('available','accepted') AND po.is_fulfilled = 0
+    ORDER BY FIELD(po.order_status, 'accepted', 'available'), po.expires_at ASC, po.player_order_id ASC
+");
 $stmt->bind_param('i', $userId);
 $stmt->execute();
 $allOpenOrders = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -243,10 +299,16 @@ $orders = [];
 $availableOrders = [];
 foreach ($allOpenOrders as &$orderRow) {
     $oid = (int)$orderRow['player_order_id'];
-    $stmt = $db->prepare("SELECT oi.*, i.name, i.icon, i.code, COALESCE(inv.quantity, 0) AS owned_quantity FROM order_items oi JOIN items i ON i.item_id = oi.item_id LEFT JOIN player_inventory inv ON inv.item_id = oi.item_id AND inv.user_id = ? WHERE oi.player_order_id = ?");
-    $stmt->bind_param('ii', $userId, $oid);
-    $stmt->execute();
-    $orderItemsByOrder[$oid] = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    // Build the same order_items_by_order format the client expects, from the order row itself
+    $orderItemsByOrder[$oid] = !empty($orderRow['item_id']) ? [[
+        'player_order_id' => $oid,
+        'item_id'          => $orderRow['item_id'],
+        'quantity_required' => (int)$orderRow['quantity_required'],
+        'name'             => $orderRow['item_name'] ?? '',
+        'icon'             => $orderRow['item_icon'] ?? '',
+        'code'             => $orderRow['item_code'] ?? '',
+        'owned_quantity'   => (int)($orderRow['owned_quantity'] ?? 0),
+    ]] : [];
     $remaining = max(0, strtotime($orderRow['expires_at']) - time());
     $orderRow['time_remaining_seconds'] = min($remaining, 7200);
     $orderRow['is_late'] = ($orderRow['order_status'] === 'accepted' && strtotime($orderRow['expires_at']) < time()) ? 1 : 0;
@@ -273,6 +335,16 @@ $availableOrderLimit = getAvailableOrderLimit($db);
 $shopSellLimits = getShopSellLimits($db, $userId);
 $marketStatus = getMarketStatus($db, $userId);
 $caravanStatus = getCaravanStatus($db, $userId);
+
+if (
+    !empty($caravanStatus['is_active']) &&
+    hasUnlock($db, $userId, 'bone_brine_pending') &&
+    !hasUnlock($db, $userId, 'location_bone_brine')
+) {
+    grantUnlock($db, $userId, 'location_bone_brine', 'caravan_arrival');
+    grantUnlock($db, $userId, 'bone_brine_unlocked', 'caravan_arrival');
+}
+
 $stmt = $db->prepare("SELECT COUNT(*) AS purchase_count FROM player_unlocks WHERE user_id = ? AND unlock_key LIKE 'shop_land_claim_note_%'");
 $stmt->bind_param('i', $userId);
 $stmt->execute();
@@ -399,6 +471,46 @@ $uiConfig = [
     'locked_plot_opacity' => isset($gameConfig['locked_plot_opacity']) ? (float)$gameConfig['locked_plot_opacity'] : 0.58,
 ];
 
+$mapLocationConfig = [];
+
+if (tableExists($db, 'map_location_config')) {
+    $locationKeys = [];
+
+    foreach ($locations as $loc) {
+        $key = trim((string)($loc['key'] ?? ''));
+        if ($key !== '') {
+            $locationKeys[$key] = true;
+        }
+    }
+
+    $locationKeys = array_keys($locationKeys);
+
+    if (!empty($locationKeys)) {
+        $placeholders = implode(',', array_fill(0, count($locationKeys), '?'));
+        $types = str_repeat('s', count($locationKeys));
+
+        $stmt = $db->prepare("
+            SELECT *
+            FROM map_location_config
+            WHERE location_key IN ($placeholders)
+            ORDER BY sort_order ASC, location_key ASC
+        ");
+
+        $stmt->bind_param($types, ...$locationKeys);
+        $stmt->execute();
+
+        $res = $stmt->get_result();
+
+        while ($row = $res->fetch_assoc()) {
+            $key = trim((string)($row['location_key'] ?? ''));
+
+            if ($key !== '') {
+                $mapLocationConfig[$key] = $row;
+            }
+        }
+    }
+}
+
 jsonResponse([
     'ok' => true,
     'version' => getAppVersion($db),
@@ -412,6 +524,7 @@ jsonResponse([
     'user' => array_merge($user, $progress),
     'progress' => $progress,
     'unlocks' => $unlocks,
+	'map_location_config' => $mapLocationConfig,
     'locations' => $locations,
     'map_config' => getMapConfig($db),
     'relics' => $relics,
@@ -439,6 +552,10 @@ jsonResponse([
         'objects' => $shedObjects,
         'stations' => $shedStations
     ],
+    'all_items' => (function() use ($db) {
+        $res = $db->query("SELECT item_id, code, name, item_type, icon, shop_row_icon, base_buy_price, base_sell_price FROM items WHERE is_active = 1");
+        return $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+    })(),
     'all_machines' => $allMachines,
     'all_tools' => $allTools,
     'recipes' => $recipes,
@@ -463,5 +580,50 @@ jsonResponse([
     'available_order_limit' => $availableOrderLimit,
     'order_items' => $orderItems,
     'order_items_by_order' => $orderItemsByOrder,
-    'server_time' => date('Y-m-d H:i:s')
+    'server_time'         => date('Y-m-d H:i:s'),
+    'ornamental_pot_types' => (function() use ($db) {
+        if (!tableExists($db, 'ornamental_pot_types')) return [];
+        $res = $db->query("SELECT * FROM ornamental_pot_types WHERE is_active = 1 ORDER BY sort_order ASC");
+        return $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+    })(),
+    'pot_placements' => (function() use ($db, $userId, $gardenId, $isOrnamental, $gameConfig) {
+        if (!$isOrnamental || !tableExists($db, 'player_pot_placements')) return [];
+        $plantCycles = columnExists($db, 'plants', 'max_cycles') ? 'p.max_cycles' : 'p.growth_steps';
+        $stmt = $db->prepare("
+            SELECT pp.*,
+                   pt.code AS pot_type_code, pt.name AS pot_type_name,
+                   pt.pot_size, pt.back_image, pt.front_image, pt.plant_offset_y,
+                   pc.growth_step_current, pc.water_current, pc.has_weeds, pc.has_pests,
+                   {$plantCycles} AS growth_steps, p.water_max,
+                   COALESCE(p.cycle_length_hours, 24) AS cycle_length_hours,
+                   p.code AS plant_code, p.name AS plant_name,
+                   hi.icon AS plant_mature_icon
+            FROM player_pot_placements pp
+            JOIN ornamental_pot_types pt ON pt.pot_type_id = pp.pot_type_id
+            LEFT JOIN planted_crops pc ON pc.planted_crop_id = pp.planted_crop_id AND pc.is_harvested = 0
+            LEFT JOIN plants p ON p.plant_id = pc.plant_id
+            LEFT JOIN items hi ON hi.item_id = p.harvest_item_id
+            WHERE pp.user_id = ? AND pp.garden_id = ?
+            ORDER BY pp.grid_y, pp.grid_x
+        ");
+        $stmt->bind_param('ii', $userId, $gardenId);
+        $stmt->execute();
+        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $dayLen = max(60, (int)($gameConfig['day_length_seconds'] ?? 720));
+        foreach ($rows as &$row) {
+            $grown  = !empty($row['planted_crop_id']) && (int)$row['growth_step_current'] >= (int)($row['growth_steps'] ?? 999);
+            $lastAt = $row['last_offering_at'] ? strtotime($row['last_offering_at']) : 0;
+            $row['glow_eligible'] = ($grown && (time() - $lastAt >= $dayLen)) ? 1 : 0;
+        }
+        unset($row);
+        return $rows;
+    })(),
+    'game_name'   => $gameConfig['game_name'] ?? 'Fairytale Farm',
+    'town_name'   => $gameConfig['town_name'] ?? 'Mossroot Hollow',
+    'tagline'     => $gameConfig['tagline'] ?? '',
+    'shop_hints'  => (function() use ($db) {
+        if (!tableExists($db, 'shop_hints')) return [];
+        $res = $db->query("SELECT hint_id, hint_text, hint_speaker FROM shop_hints WHERE is_active = 1 ORDER BY sort_order ASC, hint_id ASC");
+        return $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+    })()
 ]);

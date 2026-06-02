@@ -92,49 +92,254 @@ function shedPlacementOverlap(mysqli $db, int $userId, int $objectId, string $zo
     return false;
 }
 
+function playerHasMinimumReputation(mysqli $db, int $userId, int $minimum): bool
+{
+    $stmt = $db->prepare("
+        SELECT COALESCE(reputation, 0) AS reputation
+        FROM player_state
+        WHERE user_id = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+
+    $row = $stmt->get_result()->fetch_assoc();
+
+    return $row && (int)$row['reputation'] >= $minimum;
+}
+
+function playerHasRelicKey(mysqli $db, int $userId, string $relicKey): bool
+{
+    $stmt = $db->prepare("
+        SELECT 1
+        FROM player_relics
+        WHERE user_id = ?
+          AND relic_key = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param('is', $userId, $relicKey);
+    $stmt->execute();
+
+    return (bool)$stmt->get_result()->fetch_assoc();
+}
+
+function boneBrineHasArrived(mysqli $db, int $userId): bool
+{
+    return hasUnlock($db, $userId, 'location_bone_brine')
+        || hasUnlock($db, $userId, 'bone_brine_unlocked');
+}
+
+function maybeDropBoneBrineRelicFragment(mysqli $db, int $userId, int $chancePercent): bool
+{
+    if (!boneBrineHasArrived($db, $userId)) {
+        return false;
+    }
+
+    $chancePercent = max(0, min(100, $chancePercent));
+
+    if ($chancePercent <= 0) {
+        return false;
+    }
+
+    if (random_int(1, 100) > $chancePercent) {
+        return false;
+    }
+
+    return maybeDropCommonRelic($db, $userId);
+}
+
+function maybeFindBoneBrineRelicFromTilling(mysqli $db, int $userId, int $plotId): bool
+{
+    if (!playerHasMinimumReputation($db, $userId, 25)) {
+        return false;
+    }
+
+    // Relic #2 should only happen after Relic #1 has actually been collected.
+    if (!hasUnlock($db, $userId, 'first_relic_collected')) {
+        return false;
+    }
+
+    if (hasUnlock($db, $userId, 'second_relic_collected')) {
+        return false;
+    }
+
+    if (hasUnlock($db, $userId, 'bone_brine_pending')) {
+        return false;
+    }
+
+    if (playerHasRelicKey($db, $userId, 'second_field_relic')) {
+        return false;
+    }
+
+    // Reasonable chance while tilling after reputation 25.
+    if (random_int(1, 100) > 15) {
+        return false;
+    }
+
+    $stmt = $db->prepare("
+        SELECT gp.x_pos, gp.y_pos, gp.garden_id
+        FROM garden_plots gp
+        JOIN gardens g ON g.garden_id = gp.garden_id
+        WHERE gp.plot_id = ?
+          AND g.user_id = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param('ii', $plotId, $userId);
+    $stmt->execute();
+
+    $plot = $stmt->get_result()->fetch_assoc();
+
+    if (!$plot) {
+        return false;
+    }
+
+    $gardenId = (int)$plot['garden_id'];
+
+    $stmt = $db->prepare("
+        SELECT
+            MIN(x_pos) AS min_x,
+            MAX(x_pos) AS max_x,
+            MIN(y_pos) AS min_y,
+            MAX(y_pos) AS max_y
+        FROM garden_plots
+        WHERE garden_id = ?
+    ");
+    $stmt->bind_param('i', $gardenId);
+    $stmt->execute();
+
+    $bounds = $stmt->get_result()->fetch_assoc();
+
+    $minX = (int)($bounds['min_x'] ?? 0);
+    $maxX = (int)($bounds['max_x'] ?? $minX);
+    $minY = (int)($bounds['min_y'] ?? 0);
+    $maxY = (int)($bounds['max_y'] ?? $minY);
+
+    $cols = max(1, ($maxX - $minX) + 1);
+    $rows = max(1, ($maxY - $minY) + 1);
+
+    // Center of the actual tilled plot, converted into the existing x_ratio/y_ratio system.
+    $xRatio = (((int)$plot['x_pos'] - $minX) + 0.5) / $cols;
+    $yRatio = (((int)$plot['y_pos'] - $minY) + 0.5) / $rows;
+
+    // Keep it safely inside the canvas padding.
+    $xRatio = max(0.06, min(0.94, $xRatio));
+    $yRatio = max(0.06, min(0.94, $yRatio));
+
+    $stmt = $db->prepare("
+        INSERT INTO player_relics
+            (
+                user_id,
+                relic_key,
+                display_name,
+                relic_type,
+                source_action,
+                x_ratio,
+                y_ratio,
+                visual_state,
+                discovered_at
+            )
+        VALUES
+            (
+                ?,
+                'second_field_relic',
+                'Cursed Found Relic',
+                'oddity',
+                'till',
+                ?,
+                ?,
+                'waiting',
+                NOW()
+            )
+    ");
+
+    $stmt->bind_param('idd', $userId, $xRatio, $yRatio);
+    $stmt->execute();
+
+    return true;
+}
+
 try {
     $db->begin_transaction();
 
     if ($action === 'till') {
-        $plotId = (int) ($input['plot_id'] ?? 0);
+    $plotId = (int) ($input['plot_id'] ?? 0);
 
-        if ($isTrustedGardenAction) {
-            $progress = max(0, min(100, (int)($input['till_progress'] ?? 0)));
-            $isTilled = !empty($input['is_tilled']) || $progress >= 100 ? 1 : 0;
-            $stmt = $db->prepare("
-                UPDATE garden_plots gp
-                JOIN gardens g ON g.garden_id = gp.garden_id
-                SET gp.till_progress = ?, gp.is_tilled = ?
-                WHERE gp.plot_id = ? AND g.user_id = ? AND gp.is_unlocked = 1
-            ");
-            $stmt->bind_param('iiii', $progress, $isTilled, $plotId, $userId);
-            $stmt->execute();
-            $db->commit();
-            jsonResponse(['ok' => true, 'message' => 'Tilled.']);
-        }
+    if ($isTrustedGardenAction) {
+        $progress = max(0, min(100, (int)($input['till_progress'] ?? 0)));
+        $isTilled = !empty($input['is_tilled']) || $progress >= 100 ? 1 : 0;
 
-        $tool = getPlayerTool($db, $userId, 'hoe');
-        $strength = (int) $tool['strength'];
-
-        $stmt = $db->prepare("
-            UPDATE garden_plots gp
-            JOIN gardens g ON g.garden_id = gp.garden_id
-            SET gp.till_progress = LEAST(100, gp.till_progress + ?),
-                gp.is_tilled = CASE WHEN LEAST(100, gp.till_progress + ?) >= 100 THEN 1 ELSE gp.is_tilled END
-            WHERE gp.plot_id = ? AND g.user_id = ? AND gp.is_unlocked = 1
-        ");
-        $stmt->bind_param('iiii', $strength, $strength, $plotId, $userId);
+$stmt = $db->prepare("
+    UPDATE garden_plots gp
+    JOIN gardens g ON g.garden_id = gp.garden_id
+    SET gp.till_progress = GREATEST(gp.till_progress, ?),
+        gp.is_tilled = GREATEST(gp.is_tilled, ?)
+    WHERE gp.plot_id = ?
+      AND g.user_id = ?
+      AND gp.is_unlocked = 1
+");
+        $stmt->bind_param('iiii', $progress, $isTilled, $plotId, $userId);
         $stmt->execute();
 
-        $relicName = maybeFindFirstRelicFromTilling($db, $userId, $plotId, $tool);
-        $message = toolMessage($tool, 'Tilled.');
-        if ($relicName) {
-            $message = 'Something strange surfaced in the soil.';
-        }
-
         $db->commit();
-        jsonResponse(['ok' => true, 'message' => $message, 'relic_spawned' => (bool)$relicName, 'relic_found' => $relicName]);
+        jsonResponse(['ok' => true, 'message' => 'Tilled.']);
     }
+
+    $tool = getPlayerTool($db, $userId, 'hoe');
+    $strength = (int) $tool['strength'];
+
+    $stmt = $db->prepare("
+        UPDATE garden_plots gp
+        JOIN gardens g ON g.garden_id = gp.garden_id
+        SET gp.till_progress = LEAST(100, gp.till_progress + ?),
+            gp.is_tilled = CASE
+                WHEN LEAST(100, gp.till_progress + ?) >= 100 THEN 1
+                ELSE gp.is_tilled
+            END
+        WHERE gp.plot_id = ?
+          AND g.user_id = ?
+          AND gp.is_unlocked = 1
+    ");
+    $stmt->bind_param('iiii', $strength, $strength, $plotId, $userId);
+    $stmt->execute();
+
+    $firstRelicName = null;
+$secondRelic = false;
+$fragmentDropped = false;
+
+$canFindFirstRelic =
+    !hasUnlock($db, $userId, 'first_relic_collected') &&
+    !playerHasRelicKey($db, $userId, 'first_field_relic');
+
+if ($canFindFirstRelic) {
+    $firstRelicName = maybeFindFirstRelicFromTilling($db, $userId, $plotId, $tool);
+}
+
+if (!$firstRelicName) {
+    $secondRelic = maybeFindBoneBrineRelicFromTilling($db, $userId, $plotId);
+
+    if (!$secondRelic) {
+        // After Bone & Brine have actually arrived, hoeing has a flat 10% fragment chance.
+        $fragmentDropped = maybeDropBoneBrineRelicFragment($db, $userId, 10);
+    }
+}
+
+    $message = toolMessage($tool, 'Tilled.');
+
+    if ($firstRelicName || $secondRelic) {
+        $message = 'Something strange surfaced in the soil.';
+    } elseif ($fragmentDropped) {
+        $message = 'You found a rune fragment in the soil.';
+    }
+
+    $db->commit();
+
+    jsonResponse([
+        'ok' => true,
+        'message' => $message,
+        'relic_spawned' => (bool)($firstRelicName || $secondRelic),
+        'relic_found' => $firstRelicName ?: ($secondRelic ? 'Bone & Brine Relic' : null)
+    ]);
+}
 
     if ($action === 'water') {
         $cropId = (int) ($input['planted_crop_id'] ?? 0);
@@ -145,7 +350,7 @@ try {
                 $stmt = $db->prepare("
                     UPDATE planted_crops pc
                     JOIN plants p ON p.plant_id = pc.plant_id
-                    SET pc.water_current = LEAST(p.water_max, ?)
+                    SET pc.water_current = GREATEST(pc.water_current, LEAST(p.water_max, ?))
                     WHERE pc.planted_crop_id = ? AND pc.user_id = ? AND pc.is_harvested = 0
                 ");
                 $stmt->bind_param('iii', $water, $cropId, $userId);
@@ -185,45 +390,201 @@ try {
         jsonResponse(['ok' => true, 'message' => toolMessage($tool, 'Watered.')]);
     }
 
-    if ($action === 'dig') {
-        $cropId = (int) ($input['planted_crop_id'] ?? 0);
-        $tool = getPlayerTool($db, $userId, 'shovel');
-        $strength = (int) $tool['strength'];
+if ($action === 'dig') {
+    $cropId = (int) ($input['planted_crop_id'] ?? 0);
 
-        $stmt = $db->prepare("
-            SELECT growth_step_current
-            FROM planted_crops
-            WHERE planted_crop_id = ? AND user_id = ? AND is_harvested = 0
-            LIMIT 1
-        ");
-        $stmt->bind_param('ii', $cropId, $userId);
+    $stmt = $db->prepare("
+        SELECT
+            pc.planted_crop_id,
+            pc.garden_id,
+            pc.origin_x,
+            pc.origin_y,
+            pc.growth_step_current,
+            p.width,
+            p.height
+        FROM planted_crops pc
+        JOIN plants p ON p.plant_id = pc.plant_id
+        WHERE pc.planted_crop_id = ?
+          AND pc.user_id = ?
+          AND pc.is_harvested = 0
+        LIMIT 1
+    ");
+    $stmt->bind_param('ii', $cropId, $userId);
+    $stmt->execute();
+
+    $crop = $stmt->get_result()->fetch_assoc();
+
+    if (!$crop) {
+        throw new RuntimeException('Crop not found.');
+    }
+
+    $currentStage = max(0, (int)$crop['growth_step_current']);
+
+    // After Bone & Brine have arrived:
+    // stage 0 = 0%
+    // stage 1 = 20%
+    // stage 2 = 40%
+    // stage 3 = 60%
+    // stage 4 = 80%
+    // stage 5+ = 100%
+    $fragmentChance = min(100, $currentStage * 20);
+    $fragmentDropped = maybeDropBoneBrineRelicFragment($db, $userId, $fragmentChance);
+
+    $stmt = $db->prepare("
+        UPDATE planted_crops
+        SET is_harvested = 1
+        WHERE planted_crop_id = ?
+          AND user_id = ?
+    ");
+    $stmt->bind_param('ii', $cropId, $userId);
+    $stmt->execute();
+
+    $gardenId = (int)$crop['garden_id'];
+    $originX  = (int)$crop['origin_x'];
+    $originY  = (int)$crop['origin_y'];
+    $width    = max(1, (int)$crop['width']);
+    $height   = max(1, (int)$crop['height']);
+
+    $x2 = $originX + $width;
+    $y2 = $originY + $height;
+
+    $stmt = $db->prepare("
+        UPDATE garden_plots
+        SET is_tilled = 0,
+            till_progress = 0
+        WHERE garden_id = ?
+          AND x_pos >= ?
+          AND x_pos < ?
+          AND y_pos >= ?
+          AND y_pos < ?
+    ");
+    $stmt->bind_param('iiiii', $gardenId, $originX, $x2, $originY, $y2);
+    $stmt->execute();
+
+    $message = 'Crop dug up.';
+
+    if ($fragmentDropped) {
+        $message .= ' You found a rune fragment in the roots.';
+    }
+
+    $db->commit();
+
+    jsonResponse([
+        'ok' => true,
+        'message' => $message,
+        'fragment_dropped' => $fragmentDropped
+    ]);
+} 
+ 
+    if ($action === 'place_pot') {
+        $gardenId  = (int)($input['garden_id']  ?? 0);
+        $potTypeId = (int)($input['pot_type_id'] ?? 0);
+        $gx        = max(1, (int)($input['grid_x'] ?? 1));
+        $gy        = max(1, (int)($input['grid_y'] ?? 1));
+
+        $stmt = $db->prepare("SELECT g.garden_id, gt.code AS garden_type_code FROM gardens g JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id WHERE g.garden_id = ? AND g.user_id = ? LIMIT 1");
+        $stmt->bind_param('ii', $gardenId, $userId);
         $stmt->execute();
-        $crop = $stmt->get_result()->fetch_assoc();
+        $garden = $stmt->get_result()->fetch_assoc();
+        if (!$garden || $garden['garden_type_code'] !== 'ornamental') throw new RuntimeException('Not an ornamental garden.');
 
-        if (!$crop) {
-            throw new RuntimeException('Crop not found.');
+        $stmt = $db->prepare("SELECT pt.*, i.item_id FROM ornamental_pot_types pt JOIN items i ON i.item_id = pt.item_id WHERE pt.pot_type_id = ? AND pt.is_active = 1 LIMIT 1");
+        $stmt->bind_param('i', $potTypeId);
+        $stmt->execute();
+        $potType = $stmt->get_result()->fetch_assoc();
+        if (!$potType) throw new RuntimeException('Pot type not found.');
+
+        $stmt = $db->prepare("SELECT placement_id FROM player_pot_placements WHERE user_id = ? AND garden_id = ? AND grid_x = ? AND grid_y = ? LIMIT 1");
+        $stmt->bind_param('iiii', $userId, $gardenId, $gx, $gy);
+        $stmt->execute();
+        if ($stmt->get_result()->fetch_assoc()) throw new RuntimeException('A pot is already there.');
+
+        if (!removeInventory($db, $userId, (int)$potType['item_id'], 1)) throw new RuntimeException('You do not have that pot.');
+
+        $stmt = $db->prepare("INSERT INTO player_pot_placements (user_id, garden_id, pot_type_id, grid_x, grid_y) VALUES (?, ?, ?, ?, ?)");
+        $stmt->bind_param('iiiii', $userId, $gardenId, $potTypeId, $gx, $gy);
+        $stmt->execute();
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => $potType['name'] . ' placed.']);
+    }
+
+    if ($action === 'dig_pot_plant') {
+        $placementId  = (int)($input['placement_id']  ?? 0);
+        $plantedCropId = (int)($input['planted_crop_id'] ?? 0);
+
+        $stmt = $db->prepare("SELECT pp.placement_id FROM player_pot_placements pp WHERE pp.placement_id = ? AND pp.user_id = ? LIMIT 1");
+        $stmt->bind_param('ii', $placementId, $userId);
+        $stmt->execute();
+        if (!$stmt->get_result()->fetch_assoc()) throw new RuntimeException('Pot not found.');
+
+        // Mark the planted crop as harvested (removed)
+        if ($plantedCropId > 0) {
+            $stmt = $db->prepare("UPDATE planted_crops SET is_harvested = 1 WHERE planted_crop_id = ? AND garden_id IN (SELECT garden_id FROM player_pot_placements WHERE placement_id = ?)");
+            $stmt->bind_param('ii', $plantedCropId, $placementId);
+            $stmt->execute();
         }
 
-        $newStage = max(0, (int) $crop['growth_step_current'] - $strength);
-
-        if ($newStage <= 0) {
-            $stmt = $db->prepare("UPDATE planted_crops SET is_harvested = 1 WHERE planted_crop_id = ? AND user_id = ?");
-            $stmt->bind_param('ii', $cropId, $userId);
-            $stmt->execute();
-            $message = $tool['complete_message'] ?: toolMessage($tool, 'Dug up.');
-        } else {
-            $stmt = $db->prepare("
-                UPDATE planted_crops
-                SET growth_step_current = ?, growth_progress_seconds = 0
-                WHERE planted_crop_id = ? AND user_id = ?
-            ");
-            $stmt->bind_param('iii', $newStage, $cropId, $userId);
-            $stmt->execute();
-            $message = toolMessage($tool, 'Dug.');
-        }
+        // Detach the crop from the pot
+        $stmt = $db->prepare("UPDATE player_pot_placements SET planted_crop_id = NULL, last_offering_at = NULL WHERE placement_id = ? AND user_id = ?");
+        $stmt->bind_param('ii', $placementId, $userId);
+        $stmt->execute();
 
         $db->commit();
-        jsonResponse(['ok' => true, 'message' => $message]);
+        jsonResponse(['ok' => true, 'message' => 'Plant removed.']);
+    }
+
+    if ($action === 'remove_pot') {
+        $placementId = (int)($input['placement_id'] ?? 0);
+        $stmt = $db->prepare("SELECT pp.*, pt.item_id FROM player_pot_placements pp JOIN ornamental_pot_types pt ON pt.pot_type_id = pp.pot_type_id WHERE pp.placement_id = ? AND pp.user_id = ? LIMIT 1");
+        $stmt->bind_param('ii', $placementId, $userId);
+        $stmt->execute();
+        $placement = $stmt->get_result()->fetch_assoc();
+        if (!$placement) throw new RuntimeException('Pot not found.');
+        if (!empty($placement['planted_crop_id'])) throw new RuntimeException('Remove the plant first.');
+
+        addInventory($db, $userId, (int)$placement['item_id'], 1);
+        $stmt = $db->prepare("DELETE FROM player_pot_placements WHERE placement_id = ? AND user_id = ?");
+        $stmt->bind_param('ii', $placementId, $userId);
+        $stmt->execute();
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'Pot returned to backpack.']);
+    }
+
+    if ($action === 'collect_pot_offering') {
+        $placementId = (int)($input['placement_id'] ?? 0);
+        $stmt = $db->prepare("
+            SELECT pp.*, pc.growth_step_current, p.max_cycles AS growth_steps
+            FROM player_pot_placements pp
+            LEFT JOIN planted_crops pc ON pc.planted_crop_id = pp.planted_crop_id AND pc.is_harvested = 0
+            LEFT JOIN plants p ON p.plant_id = pc.plant_id
+            WHERE pp.placement_id = ? AND pp.user_id = ? LIMIT 1
+        ");
+        $stmt->bind_param('ii', $placementId, $userId);
+        $stmt->execute();
+        $placement = $stmt->get_result()->fetch_assoc();
+        if (!$placement || empty($placement['planted_crop_id'])) throw new RuntimeException('Nothing growing here.');
+
+        if ((int)$placement['growth_step_current'] < (int)$placement['growth_steps']) {
+            throw new RuntimeException('Not fully grown yet.');
+        }
+
+        $config   = getGameConfig($db);
+        $dayLen   = max(60, (int)($config['day_length_seconds'] ?? 720));
+        $lastAt   = $placement['last_offering_at'] ? strtotime($placement['last_offering_at']) : 0;
+        if ($lastAt && time() - $lastAt < $dayLen) throw new RuntimeException('The fae have not visited yet today.');
+
+        $faeItem = $db->query("SELECT item_id, icon, name FROM items WHERE code = 'fae_tip' AND is_active = 1 LIMIT 1")->fetch_assoc();
+        if (!$faeItem) throw new RuntimeException('Missing fae offering item.');
+
+        $qty = random_int(1, 3);
+        addInventory($db, $userId, (int)$faeItem['item_id'], $qty);
+
+        $stmt = $db->prepare("UPDATE player_pot_placements SET last_offering_at = NOW() WHERE placement_id = ? AND user_id = ?");
+        $stmt->bind_param('ii', $placementId, $userId);
+        $stmt->execute();
+
+        $db->commit();
+        jsonResponse(['ok' => true, 'message' => 'The fae left ' . $faeItem['icon'] . ' ×' . $qty . '.', 'qty' => $qty]);
     }
 
     if ($action === 'plant') {
@@ -232,12 +593,55 @@ try {
         $x = (int) ($input['x'] ?? 0);
         $y = (int) ($input['y'] ?? 0);
 
-        $stmt = $db->prepare("SELECT garden_id FROM gardens WHERE garden_id = ? AND user_id = ? LIMIT 1");
+        $stmt = $db->prepare("SELECT g.garden_id, gt.code AS garden_type_code FROM gardens g JOIN garden_types gt ON gt.garden_type_id = g.garden_type_id WHERE g.garden_id = ? AND g.user_id = ? LIMIT 1");
         $stmt->bind_param('ii', $gardenId, $userId);
         $stmt->execute();
+        $gardenRow = $stmt->get_result()->fetch_assoc();
 
-        if (!$stmt->get_result()->fetch_assoc()) {
+        if (!$gardenRow) {
             throw new RuntimeException('Garden not found.');
+        }
+
+        // Ornamental pot planting — bypass normal plot checks
+        if ($gardenRow['garden_type_code'] === 'ornamental') {
+            $stmt = $db->prepare("SELECT pp.*, pt.pot_size FROM player_pot_placements pp JOIN ornamental_pot_types pt ON pt.pot_type_id = pp.pot_type_id WHERE pp.user_id = ? AND pp.garden_id = ? AND pp.grid_x = ? AND pp.grid_y = ? LIMIT 1");
+            $stmt->bind_param('iiii', $userId, $gardenId, $x, $y);
+            $stmt->execute();
+            $placement = $stmt->get_result()->fetch_assoc();
+            if (!$placement) throw new RuntimeException('No pot at that position.');
+            if (!empty($placement['planted_crop_id'])) throw new RuntimeException('This pot already has a plant.');
+
+            $stmt = $db->prepare("SELECT *, COALESCE(cycle_length_hours, 24) AS cycle_length_hours FROM plants WHERE plant_id = ? AND is_active = 1 LIMIT 1");
+            $stmt->bind_param('i', $plantId);
+            $stmt->execute();
+            $plant = $stmt->get_result()->fetch_assoc();
+            if (!$plant) throw new RuntimeException('Plant not found.');
+
+            $potSize   = (string)($placement['pot_size'] ?? 'small');
+            $plantSize = (string)($plant['ornamental_pot_size'] ?? 'small');
+            if ($plantSize !== 'any' && $plantSize !== $potSize) {
+                throw new RuntimeException("This plant needs a {$plantSize} pot.");
+            }
+
+            if (!removeInventory($db, $userId, (int)$plant['seed_item_id'], 1)) throw new RuntimeException('You need seeds for that plant.');
+
+            $clock = getGameClock($db, $userId);
+            $cycleIndex = cycleIndexForElapsedHours((float)$clock['total_game_hours_elapsed'], (int)$plant['cycle_hour'], (int)$plant['cycle_length_hours']);
+
+            $stmt = $db->prepare("INSERT INTO planted_crops (user_id, garden_id, plant_id, origin_x, origin_y, water_current, last_cycle_index) VALUES (?, ?, ?, ?, ?, 0, ?)");
+            $stmt->bind_param('iiiiii', $userId, $gardenId, $plantId, $x, $y, $cycleIndex);
+            $stmt->execute();
+            $plantedCropId = (int)$db->insert_id;
+
+            $ornamentalPlacementId = (int)$placement['placement_id'];
+            $stmt = $db->prepare("UPDATE player_pot_placements SET planted_crop_id = ? WHERE placement_id = ? AND user_id = ?");
+            $stmt->bind_param('iii', $plantedCropId, $ornamentalPlacementId, $userId);
+            $stmt->execute();
+
+            if (($plant['code'] ?? '') === 'hauntling_pepper') grantUnlock($db, $userId, 'hauntling_pepper_planted', 'plant_action');
+
+            $db->commit();
+            jsonResponse(['ok' => true, 'message' => $plant['name'] . ' planted.', 'planted_crop_id' => $plantedCropId]);
         }
 
         $place = canPlacePlant($db, $gardenId, $plantId, $x, $y);
@@ -254,7 +658,7 @@ try {
         }
 
         $clock = getGameClock($db, $userId);
-        $plantCycleIndex = cycleIndexForElapsedHours((float)$clock['total_game_hours_elapsed'], (int)$plant['cycle_hour']);
+        $plantCycleIndex = cycleIndexForElapsedHours((float)$clock['total_game_hours_elapsed'], (int)$plant['cycle_hour'], (int)($plant['cycle_length_hours'] ?? 24));
 
         $stmt = $db->prepare("
             INSERT INTO planted_crops (user_id, garden_id, plant_id, origin_x, origin_y, water_current, last_cycle_index)
@@ -263,6 +667,11 @@ try {
         $stmt->bind_param('iiiiii', $userId, $gardenId, $plantId, $x, $y, $plantCycleIndex);
         $stmt->execute();
         $plantedCropId = (int)$db->insert_id;
+
+        // Grant a flag on first plant of special crops so event triggers can detect it
+        if (($plant['code'] ?? '') === 'hauntling_pepper') {
+            grantUnlock($db, $userId, 'hauntling_pepper_planted', 'plant_action');
+        }
 
         $db->commit();
         jsonResponse(['ok' => true, 'message' => $plant['name'] . ' planted.', 'planted_crop_id' => $plantedCropId]);
@@ -310,6 +719,7 @@ try {
 
         $stmt = $db->prepare("
             SELECT pc.*, {$plantCyclesSelect} AS growth_steps, p.harvest_item_id, p.harvest_min, p.harvest_max, p.name,
+                   p.allowed_garden_type_code,
                    COALESCE(problem_counts.weed_count, 0) AS weed_count
             FROM planted_crops pc
             JOIN plants p ON p.plant_id = pc.plant_id
@@ -328,6 +738,10 @@ try {
 
         if (!$crop) {
             throw new RuntimeException('Crop not found.');
+        }
+
+        if (($crop['allowed_garden_type_code'] ?? '') === 'ornamental') {
+            throw new RuntimeException('Ornamental plants are not harvested — the fae will leave offerings near them once they bloom.');
         }
 
         if ((int) $crop['growth_step_current'] < (int) $crop['growth_steps']) {
@@ -383,10 +797,12 @@ try {
         $gardenTypeId = (int)($input['garden_type_id'] ?? 0);
         if ($gardenId <= 0 || $gardenTypeId <= 0) throw new RuntimeException('Missing garden or garden type.');
 
-        $stmt = $db->prepare("SELECT garden_id FROM gardens WHERE garden_id = ? AND user_id = ? LIMIT 1");
+        $stmt = $db->prepare("SELECT garden_id, is_type_locked FROM gardens WHERE garden_id = ? AND user_id = ? LIMIT 1");
         $stmt->bind_param('ii', $gardenId, $userId);
         $stmt->execute();
-        if (!$stmt->get_result()->fetch_assoc()) throw new RuntimeException('Garden not found.');
+        $gardenRow = $stmt->get_result()->fetch_assoc();
+        if (!$gardenRow) throw new RuntimeException('Garden not found.');
+        if ((int)($gardenRow['is_type_locked'] ?? 0)) throw new RuntimeException('This garden type is fixed and cannot be changed.');
 
         $stmt = $db->prepare("SELECT COUNT(*) AS c FROM planted_crops WHERE garden_id = ? AND is_harvested = 0");
         $stmt->bind_param('i', $gardenId);
@@ -604,38 +1020,85 @@ try {
         jsonResponse(['ok' => true, 'message' => $tool['name'] . ' bought.']);
     }
 
-    if ($action === 'collect_relic') {
-        $relicId = (int)($input['relic_id'] ?? 0);
-        $stmt = $db->prepare("SELECT * FROM player_relics WHERE relic_id = ? AND user_id = ? AND collected_at IS NULL LIMIT 1");
-        $stmt->bind_param('ii', $relicId, $userId);
-        $stmt->execute();
-        $relic = $stmt->get_result()->fetch_assoc();
-        if (!$relic) throw new RuntimeException('Relic not found.');
+if ($action === 'collect_relic') {
+    $relicId = (int)($input['relic_id'] ?? 0);
 
-        $item = $db->query("SELECT item_id, code, name, icon FROM items WHERE code = 'relic_first_oddity' LIMIT 1")->fetch_assoc();
-        if (!$item) throw new RuntimeException('Missing relic item.');
+    $stmt = $db->prepare("
+        SELECT *
+        FROM player_relics
+        WHERE relic_id = ?
+          AND user_id = ?
+          AND collected_at IS NULL
+        LIMIT 1
+    ");
+    $stmt->bind_param('ii', $relicId, $userId);
+    $stmt->execute();
 
-        addInventory($db, $userId, (int)$item['item_id'], 1);
+    $relic = $stmt->get_result()->fetch_assoc();
 
-        $stmt = $db->prepare("UPDATE player_relics SET collected_at = NOW(), visual_state = 'collected' WHERE relic_id = ? AND user_id = ?");
-        $stmt->bind_param('ii', $relicId, $userId);
-        $stmt->execute();
-
-        grantUnlock($db, $userId, 'first_relic_collected', 'first_relic_pickup');
-        scheduleMadamRuneVisit($db, $userId);
-
-        $db->commit();
-        jsonResponse([
-            'ok' => true,
-            'message' => 'Relic taken.',
-            'rewards' => [[
-                'code' => $item['code'],
-                'name' => $item['name'],
-                'icon' => $item['icon'],
-                'quantity' => 1
-            ]]
-        ]);
+    if (!$relic) {
+        throw new RuntimeException('Relic not found.');
     }
+
+    $relicKey = (string)($relic['relic_key'] ?? 'first_field_relic');
+
+    $itemCode = $relicKey === 'second_field_relic'
+        ? 'relic_second_oddity'
+        : 'relic_first_oddity';
+
+    $flagKey = $relicKey === 'second_field_relic'
+        ? 'second_relic_collected'
+        : 'first_relic_collected';
+
+    $stmt = $db->prepare("
+        SELECT item_id, code, name, icon
+        FROM items
+        WHERE code = ?
+        LIMIT 1
+    ");
+    $stmt->bind_param('s', $itemCode);
+    $stmt->execute();
+
+    $item = $stmt->get_result()->fetch_assoc();
+
+    if (!$item) {
+        throw new RuntimeException('Missing relic item.');
+    }
+
+    addInventory($db, $userId, (int)$item['item_id'], 1);
+
+    $stmt = $db->prepare("
+        UPDATE player_relics
+        SET collected_at = NOW(),
+            visual_state = 'collected'
+        WHERE relic_id = ?
+          AND user_id = ?
+    ");
+    $stmt->bind_param('ii', $relicId, $userId);
+    $stmt->execute();
+
+    grantUnlock($db, $userId, $flagKey, 'relic_pickup');
+
+    if ($relicKey === 'second_field_relic') {
+        // They do not unlock instantly. They are queued to arrive with the next caravan.
+        grantUnlock($db, $userId, 'bone_brine_pending', 'second_relic_pickup');
+    } else {
+        scheduleMadamRuneVisit($db, $userId);
+    }
+
+    $db->commit();
+
+    jsonResponse([
+        'ok' => true,
+        'message' => 'Relic taken.',
+        'rewards' => [[
+            'code' => $item['code'],
+            'name' => $item['name'],
+            'icon' => $item['icon'],
+            'quantity' => 1
+        ]]
+    ]);
+}
 
     if ($action === 'advance_story_event') {
         $eventKey = trim((string)($input['event_key'] ?? ''));
@@ -899,7 +1362,7 @@ try {
         $recipeId = (int) ($input['recipe_id'] ?? 0);
         $quantity = max(1, (int) ($input['quantity'] ?? 1));
 
-        $stmt = $db->prepare("SELECT * FROM processing_recipes WHERE recipe_id = ? AND is_active = 1 LIMIT 1");
+        $stmt = $db->prepare("SELECT * FROM machine_recipes WHERE recipe_id = ? AND is_active = 1 LIMIT 1");
         $stmt->bind_param('i', $recipeId);
         $stmt->execute();
         $recipe = $stmt->get_result()->fetch_assoc();
@@ -910,12 +1373,13 @@ try {
 
         $stmt = $db->prepare("
             SELECT pm.player_machine_id, pm.quantity,
+                   m.queue_size,
                    COUNT(j.job_id) AS active_jobs
             FROM player_machines pm
             JOIN machines m ON m.machine_id = pm.machine_id
             LEFT JOIN processing_jobs j ON j.player_machine_id = pm.player_machine_id AND j.is_collected = 0
             WHERE pm.user_id = ? AND m.machine_type = ?
-            GROUP BY pm.player_machine_id, pm.quantity
+            GROUP BY pm.player_machine_id, pm.quantity, m.queue_size
             LIMIT 1
         ");
         $stmt->bind_param('is', $userId, $recipe['machine_type']);
@@ -925,8 +1389,9 @@ try {
         if (!$machine) {
             throw new RuntimeException('You need the right equipment.');
         }
-        if ((int)($machine['active_jobs'] ?? 0) >= (int)($machine['quantity'] ?? 1)) {
-            throw new RuntimeException('All of those machines are already busy.');
+        $maxJobs = max(1, (int)($machine['quantity'] ?? 1)) * max(1, (int)($machine['queue_size'] ?? 1));
+        if ((int)($machine['active_jobs'] ?? 0) >= $maxJobs) {
+            throw new RuntimeException('Queue is full (' . $maxJobs . ' slots).');
         }
 
         $needed = (int) $recipe['input_quantity'] * $quantity;
@@ -935,7 +1400,12 @@ try {
             throw new RuntimeException('Not enough ingredients.');
         }
 
-        $seconds = (int) $recipe['processing_time_seconds'] * $quantity;
+        $config = getGameConfig($db);
+        $dayLength = max(60, (int)($config['day_length_seconds'] ?? 720));
+        $cycleCount = max(1, (int)($recipe['cycle_count'] ?? 1));
+        $cycleHours = max(1, (int)($recipe['cycle_hours'] ?? 12));
+        $secondsPerJob = (int) round($cycleCount * $cycleHours * ($dayLength / 24));
+        $seconds = $secondsPerJob * $quantity;
         $finishesAt = date('Y-m-d H:i:s', time() + $seconds);
         $playerMachineId = (int) $machine['player_machine_id'];
 
@@ -954,9 +1424,12 @@ try {
         $jobId = (int) ($input['job_id'] ?? 0);
 
         $stmt = $db->prepare("
-            SELECT j.*, r.output_item_id, r.output_quantity
+            SELECT j.*,
+                   r.output_item_id,
+                   COALESCE(r.output_min, r.output_quantity, 1) AS output_min,
+                   COALESCE(r.output_max, r.output_quantity, 1) AS output_max
             FROM processing_jobs j
-            JOIN processing_recipes r ON r.recipe_id = j.recipe_id
+            JOIN machine_recipes r ON r.recipe_id = j.recipe_id
             WHERE j.job_id = ? AND j.user_id = ? AND j.is_collected = 0
             LIMIT 1
         ");
@@ -972,7 +1445,9 @@ try {
             throw new RuntimeException('Not finished yet.');
         }
 
-        $qty = (int) $job['output_quantity'] * (int) $job['quantity'];
+        $outMin = (int)($job['output_min'] ?? $job['output_quantity'] ?? 1);
+        $outMax = (int)($job['output_max'] ?? $job['output_quantity'] ?? 1);
+        $qty = random_int(max(1, $outMin), max($outMin, $outMax)) * (int) $job['quantity'];
         addInventory($db, $userId, (int) $job['output_item_id'], $qty);
 
         $stmt = $db->prepare("UPDATE processing_jobs SET is_collected = 1 WHERE job_id = ? AND user_id = ?");
@@ -984,43 +1459,107 @@ try {
     }
 
 
-    if ($action === 'collect_pouch') {
-        $pouchId = (int) ($input['pouch_id'] ?? 0);
+if ($action === 'collect_pouch') {
+    $pouchId = (int) ($input['pouch_id'] ?? 0);
 
-        $stmt = $db->prepare("SELECT * FROM player_pouches WHERE pouch_id = ? AND user_id = ? AND is_claimed = 0 LIMIT 1");
-        $stmt->bind_param('ii', $pouchId, $userId);
-        $stmt->execute();
-        $pouch = $stmt->get_result()->fetch_assoc();
+    $stmt = $db->prepare("
+        SELECT *
+        FROM player_pouches
+        WHERE pouch_id = ?
+          AND user_id = ?
+          AND is_claimed = 0
+        LIMIT 1
+    ");
+    $stmt->bind_param('ii', $pouchId, $userId);
+    $stmt->execute();
 
-        if (!$pouch) {
-            throw new RuntimeException('Pouch not found.');
-        }
+    $pouch = $stmt->get_result()->fetch_assoc();
 
-        $count = max(1, (int) $pouch['seed_count']);
-        $seeds = $db->query("SELECT item_id, icon, name FROM items WHERE item_type = 'seed' AND is_active = 1 ORDER BY RAND() LIMIT " . $count)->fetch_all(MYSQLI_ASSOC);
-
-        $found = [];
-        foreach ($seeds as $seed) {
-            addInventory($db, $userId, (int) $seed['item_id'], 1);
-            $key = $seed['icon'] ?: $seed['name'];
-            if (!isset($found[$key])) $found[$key] = 0;
-            $found[$key]++;
-        }
-        $parts = [];
-        foreach ($found as $icon => $qty) $parts[] = $icon . ' ×' . $qty;
-
-        $stmt = $db->prepare("UPDATE player_pouches SET is_claimed = 1, visual_state = 'leaving', claimed_at = NOW() WHERE pouch_id = ? AND user_id = ?");
-        $stmt->bind_param('ii', $pouchId, $userId);
-        $stmt->execute();
-
-        $stmt = $db->prepare("UPDATE player_state SET last_pouch_at = NOW() WHERE user_id = ?");
-        $stmt->bind_param('i', $userId);
-        $stmt->execute();
-
-        $db->commit();
-        jsonResponse(['ok' => true, 'message' => 'You open the pouch and find ' . implode(', ', $parts) . '.']);
+    if (!$pouch) {
+        throw new RuntimeException('Pouch not found.');
     }
 
+    $count = max(1, (int)($pouch['seed_count'] ?? 1));
+    $pouchType = (string)($pouch['pouch_type'] ?? 'seed');
+
+    if ($pouchType === 'fae_offering') {
+        $faeItem = $db->query("
+            SELECT item_id, name
+            FROM items
+            WHERE code = 'fae_tip'
+              AND is_active = 1
+            LIMIT 1
+        ")->fetch_assoc();
+
+        if (!$faeItem) {
+            throw new RuntimeException('Fae offering item not found.');
+        }
+
+        addInventory($db, $userId, (int)$faeItem['item_id'], $count);
+
+        $message = 'The fae left ' . ($faeItem['name'] ?? 'Fae Offering') . ' ×' . $count . ' near the blooms.';
+    } else {
+        $seedResult = $db->query("
+            SELECT item_id, name
+            FROM items
+            WHERE item_type = 'seed'
+              AND is_active = 1
+              AND base_buy_price > 0
+            ORDER BY RAND()
+            LIMIT " . $count
+        );
+
+        if (!$seedResult) {
+            throw new RuntimeException('Could not find seeds for pouch.');
+        }
+
+        $seeds = $seedResult->fetch_all(MYSQLI_ASSOC);
+        $found = [];
+
+        foreach ($seeds as $seed) {
+            addInventory($db, $userId, (int)$seed['item_id'], 1);
+
+            $key = $seed['name'] ?: 'Seed';
+            if (!isset($found[$key])) {
+                $found[$key] = 0;
+            }
+
+            $found[$key]++;
+        }
+
+        $parts = [];
+        foreach ($found as $name => $qty) {
+            $parts[] = $name . ' ×' . $qty;
+        }
+
+        $message = $parts
+            ? 'You open the pouch and find ' . implode(', ', $parts) . '.'
+            : 'You open the pouch, but it is strangely empty.';
+    }
+
+    $stmt = $db->prepare("
+        DELETE FROM player_pouches
+        WHERE pouch_id = ?
+          AND user_id = ?
+    ");
+    $stmt->bind_param('ii', $pouchId, $userId);
+    $stmt->execute();
+
+    $stmt = $db->prepare("
+        UPDATE player_state
+        SET last_pouch_at = NOW()
+        WHERE user_id = ?
+    ");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+
+    $db->commit();
+
+    jsonResponse([
+        'ok' => true,
+        'message' => $message
+    ]);
+}
 
     if ($action === 'hire_worker') {
         $workerTypeId = (int)($input['worker_type_id'] ?? 0);
@@ -1089,15 +1628,16 @@ try {
         $stmt = $db->prepare("SELECT * FROM player_orders WHERE player_order_id=? AND user_id=? AND order_status='accepted' AND is_fulfilled=0 LIMIT 1");
         $stmt->bind_param('ii', $orderId, $userId); $stmt->execute(); $order = $stmt->get_result()->fetch_assoc();
         if (!$order) throw new RuntimeException('Order is not active.');
-        $stmt = $db->prepare("SELECT * FROM order_items WHERE player_order_id=?");
-        $stmt->bind_param('i', $orderId); $stmt->execute(); $items = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
-        foreach ($items as $item) {
-            $itemId=(int)$item['item_id']; $need=(int)$item['quantity_required'];
-            $stmt=$db->prepare("SELECT quantity FROM player_inventory WHERE user_id=? AND item_id=? LIMIT 1");
-            $stmt->bind_param('ii',$userId,$itemId); $stmt->execute(); $inv=$stmt->get_result()->fetch_assoc();
+        $itemId = (int)($order['item_id'] ?? 0);
+        $need = (int)($order['quantity_required'] ?? 1);
+        if ($itemId > 0) {
+            $stmt = $db->prepare("SELECT quantity FROM player_inventory WHERE user_id=? AND item_id=? LIMIT 1");
+            $stmt->bind_param('ii', $userId, $itemId);
+            $stmt->execute();
+            $inv = $stmt->get_result()->fetch_assoc();
             if (!$inv || (int)$inv['quantity'] < $need) throw new RuntimeException('You do not have everything for this order.');
+            removeInventory($db, $userId, $itemId, $need);
         }
-        foreach ($items as $item) removeInventory($db,$userId,(int)$item['item_id'],(int)$item['quantity_required']);
         $late = strtotime($order['expires_at']) < time();
         $lateFee = max(0, min(90, (int)($order['late_fee_percent'] ?? 20)));
         $payment = (int)$order['payment_coins'];
