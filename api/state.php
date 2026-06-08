@@ -339,12 +339,14 @@ $caravanStatus = getCaravanStatus($db, $userId);
 if (
     !empty($caravanStatus['is_active']) &&
     hasUnlock($db, $userId, 'bone_brine_pending') &&
+    !hasUnlock($db, $userId, 'bone_brine_arrival_ready') &&
     !hasUnlock($db, $userId, 'location_bone_brine')
 ) {
-    grantUnlock($db, $userId, 'location_bone_brine', 'caravan_arrival');
-    grantUnlock($db, $userId, 'bone_brine_unlocked', 'caravan_arrival');
+    // Bone & Brine have arrived with this caravan.
+    // Keep this flag forever until the player completes the arrival event,
+    // even after the caravan becomes inactive/empty again.
+    grantUnlock($db, $userId, 'bone_brine_arrival_ready', 'caravan_arrival');
 }
-
 $stmt = $db->prepare("SELECT COUNT(*) AS purchase_count FROM player_unlocks WHERE user_id = ? AND unlock_key LIKE 'shop_land_claim_note_%'");
 $stmt->bind_param('i', $userId);
 $stmt->execute();
@@ -352,8 +354,37 @@ $landClaimShopPurchases = (int)($stmt->get_result()->fetch_assoc()['purchase_cou
 
 $progress = getPlayerProgress($db, $userId);
 maybeGrantMarketInvite($db, $userId);
+
 $locations = getLocationsForPlayer($db, $userId);
+
+$locationEvents = getLocationEvents($db, $userId);
+
+if (
+    hasUnlock($db, $userId, 'bone_brine_arrival_ready') &&
+    !hasUnlock($db, $userId, 'location_bone_brine')
+) {
+    $alreadyHasBoneBrineArrival = false;
+
+    foreach ($locationEvents as $evt) {
+        if (($evt['event_key'] ?? '') === 'bone_brine_arrival') {
+            $alreadyHasBoneBrineArrival = true;
+            break;
+        }
+    }
+
+    if (!$alreadyHasBoneBrineArrival) {
+        $locationEvents[] = [
+            'location_key' => 'caravan',
+            'event_key'    => 'bone_brine_arrival',
+            'title'        => 'A Cursed Arrival',
+            'tooltip'      => 'Something unpleasant and oddly well-branded waits near the caravan road.',
+            'icon'         => '!'
+        ];
+    }
+}
+
 $unlocks = [];
+
 $stmt = $db->prepare("SELECT unlock_key, source, unlocked_at FROM player_unlocks WHERE user_id = ? ORDER BY unlocked_at ASC");
 $stmt->bind_param('i', $userId);
 $stmt->execute();
@@ -530,7 +561,7 @@ jsonResponse([
     'relics' => $relics,
     'relic_pickup' => $relicPickup,
     'story_event' => $storyEvent,
-    'location_events' => getLocationEvents($db, $userId),
+	'location_events' => $locationEvents,
     'helper_types' => $helperTypes,
     'helper_equipment' => $helperEquipment,
     'helper_accessories' => $helperAccessories,

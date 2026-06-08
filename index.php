@@ -11,19 +11,7 @@ $userId = requireLogin();
   <link rel="stylesheet" href="assets/css/farm.css?v=0.4.43a">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-  <img
-    src="assets/header.png"
-    alt="Fairytale Farm"
-    class="brand-logo"
-  >
-</div>
 
-    <div class="player-box">
-      <a href="logout.php">Logout</a>
-    </div>
-  </header>
 
   <main class="game-shell">
     <section class="play-panel">
@@ -70,6 +58,18 @@ $userId = requireLogin();
     </section>
 
     <aside class="side-panel">
+
+    <div class="brand">
+  <img
+    src="assets/header.png"
+    alt="Fairytale Farm"
+    class="brand-logo"
+  >
+      <a href="logout.php" class='side-logout'>🚪Logout</a>
+</div>
+
+    
+  
       <div class="side-actions">
         <button type="button" class="small-button back-map-button" data-side-map-button hidden>🗺️ Map</button>
       </div>

@@ -1166,12 +1166,17 @@ function getLocationEvents(mysqli $db, int $userId): array
 
     $progress = getPlayerProgress($db, $userId);
     $caravanStatus = getCaravanStatus($db, $userId);
-    $context = [
-        'reputation'               => (int)$progress['reputation'],
-        'recognition'              => (int)$progress['recognition'],
-        'caravan_active'           => !empty($caravanStatus['is_active']),
-        'caravan_bone_brine_ready' => !empty($caravanStatus['bone_brine_ready']),
-    ];
+$boneBrineArrivalReady = hasUnlock($db, $userId, 'bone_brine_arrival_ready');
+
+$context = [
+    'reputation'               => (int)$progress['reputation'],
+    'recognition'              => (int)$progress['recognition'],
+    'caravan_active'           => !empty($caravanStatus['is_active']),
+
+    // Permanent quest-ready flag. Once the correct caravan has arrived,
+    // the Bone & Brine event remains available even after the caravan leaves.
+    'caravan_bone_brine_ready' => $boneBrineArrivalReady || !empty($caravanStatus['bone_brine_ready']),
+];
 
     $stmt = $db->prepare("
         SELECT et.trigger_id, et.event_id, et.location_key, et.ui_tooltip,
@@ -1218,9 +1223,39 @@ function getLocationEvents(mysqli $db, int $userId): array
 
 function canStartLocationEvent(mysqli $db, int $userId, string $eventKey, string $locationKey): bool
 {
-    foreach (getLocationEvents($db, $userId) as $event) {
-        if ($event['event_key'] === $eventKey && $event['location_key'] === $locationKey) return true;
+    $eventKey = trim($eventKey);
+    $locationKey = trim($locationKey);
+
+    // Bone & Brine arrival remains startable after the caravan has come and gone,
+    // once the caravan has already "delivered" the pending relic event.
+    if (
+        $eventKey === 'bone_brine_arrival' &&
+        in_array($locationKey, ['caravan', 'caravan_camp'], true) &&
+        hasUnlock($db, $userId, 'bone_brine_arrival_ready') &&
+        !hasUnlock($db, $userId, 'location_bone_brine')
+    ) {
+        return true;
     }
+
+    $locationAliases = [
+        'caravan'      => ['caravan', 'caravan_camp'],
+        'caravan_camp' => ['caravan', 'caravan_camp'],
+        'market'       => ['market', 'fae_market'],
+        'fae_market'   => ['market', 'fae_market'],
+        'bone_brine'   => ['bone_brine', 'bone_brine_shop'],
+    ];
+
+    $acceptedLocationKeys = $locationAliases[$locationKey] ?? [$locationKey];
+
+    foreach (getLocationEvents($db, $userId) as $event) {
+        if (
+            ($event['event_key'] ?? '') === $eventKey &&
+            in_array(($event['location_key'] ?? ''), $acceptedLocationKeys, true)
+        ) {
+            return true;
+        }
+    }
+
     return false;
 }
 
